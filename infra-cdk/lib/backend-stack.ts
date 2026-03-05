@@ -505,36 +505,36 @@ export class BackendStack extends cdk.NestedStack {
      * API Gateway defaultCorsPreflightOptions below only handles OPTIONS preflight requests.
      * See detailed explanation and fix options in: infra-cdk/lambdas/feedback/index.py
      */
-    // const api = new apigateway.RestApi(this, "FeedbackApi", {
-    //   restApiName: `${config.stack_name_base}-api`,
-    //   description: "API for user feedback and future endpoints",
-    //   defaultCorsPreflightOptions: {
-    //     allowOrigins: [frontendUrl, "http://localhost:3000"],
-    //     allowMethods: ["POST", "OPTIONS"],
-    //     allowHeaders: ["Content-Type", "Authorization"],
-    //   },
-    //   deployOptions: {
-    //     stageName: "prod",
-    //     throttlingRateLimit: 100,
-    //     throttlingBurstLimit: 200,
-    //     // cachingEnabled: true,
-    //     // cacheClusterEnabled: true,
-    //     // cacheClusterSize: "0.5",
-    //     cacheTtl: cdk.Duration.minutes(5),
-    //     loggingLevel: apigateway.MethodLoggingLevel.INFO,
-    //     dataTraceEnabled: true,
-    //     metricsEnabled: true,
-    //     accessLogDestination: new apigateway.LogGroupLogDestination(
-    //       new logs.LogGroup(this, "FeedbackApiAccessLogGroup", {
-    //         logGroupName: `/aws/apigateway/${config.stack_name_base}-api-access`,
-    //         retention: logs.RetentionDays.ONE_WEEK,
-    //         removalPolicy: cdk.RemovalPolicy.DESTROY,
-    //       })
-    //     ),
-    //     accessLogFormat: apigateway.AccessLogFormat.jsonWithStandardFields(),
-    //     tracingEnabled: true,
-    //   },
-    // })
+    const api = new apigateway.RestApi(this, "FeedbackApi", {
+      restApiName: `${config.stack_name_base}-api`,
+      description: "API for user feedback and future endpoints",
+      defaultCorsPreflightOptions: {
+        allowOrigins: [frontendUrl, "http://localhost:3000"],
+        allowMethods: ["POST", "OPTIONS"],
+        allowHeaders: ["Content-Type", "Authorization"],
+      },
+      deployOptions: {
+        stageName: "prod",
+        throttlingRateLimit: 100,
+        throttlingBurstLimit: 200,
+        // cachingEnabled: true,
+        // cacheClusterEnabled: true,
+        // cacheClusterSize: "0.5",
+        cacheTtl: cdk.Duration.minutes(5),
+        loggingLevel: apigateway.MethodLoggingLevel.INFO,
+        dataTraceEnabled: true,
+        metricsEnabled: true,
+        accessLogDestination: new apigateway.LogGroupLogDestination(
+          new logs.LogGroup(this, "FeedbackApiAccessLogGroup", {
+            logGroupName: `/aws/apigateway/${config.stack_name_base}-api-access`,
+            retention: logs.RetentionDays.ONE_WEEK,
+            removalPolicy: cdk.RemovalPolicy.DESTROY,
+          })
+        ),
+        accessLogFormat: apigateway.AccessLogFormat.jsonWithStandardFields(),
+        tracingEnabled: true,
+      },
+    })
 
     // Add request validator for API security
     const requestValidator = new apigateway.RequestValidator(this, "FeedbackApiRequestValidator", {
@@ -604,8 +604,7 @@ export class BackendStack extends cdk.NestedStack {
     })
 
     // Built-in: opensearchserverless.CfnCollection (L1/Cfn)
-    // Why VECTORSEARCH type: optimized for kNN similarity search —
-    // the algorithm that finds "semantically similar" text chunks.
+    // VECTORSEARCH type: optimized for kNN similarity search - the algorithm that finds "semantically similar" text chunks.
     const ossCollection = new opensearchserverless.CfnCollection(this, 'OSSVectorCollection', {
       name: `${config.stack_name_base}-rag-vectors`.toLowerCase(),
       type: 'VECTORSEARCH',
@@ -615,7 +614,7 @@ export class BackendStack extends cdk.NestedStack {
     ossCollection.addDependency(networkPolicy)
 
     // Built-in: opensearchserverless.CfnAccessPolicy (L1/Cfn)
-    // Why separate from IAM: OpenSearch Serverless has TWO layers:
+    // Separate from IAM: OpenSearch Serverless has TWO layers:
     //   Layer 1 - IAM: can you call AWS APIs? (create collection etc)
     //   Layer 2 - Data Access: can you read/write actual documents
     new opensearchserverless.CfnAccessPolicy(this, 'OSSDataAccessPolicy', {
@@ -671,6 +670,194 @@ export class BackendStack extends cdk.NestedStack {
       value: ossCollection.attrCollectionEndpoint,
       description: 'OpenSearch Serverless collection endpoint',
       exportName: `${config.stack_name_base}-OSSCollectionEndpoint`,
+    })
+  }
+
+  private createDocumentUploadInfra(config: AppConfig, frontendUrl: string): void {
+    const rawDocsBucket = new s3.Bucket(this, "RawDocsBucket", {
+      bucketName: `${config.stack_name_base}-raw-docs-${cdk.Aws.ACCOUNT_ID}`.toLowerCase(),
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      autoDeleteObjects: true,
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      encryption: s3.BucketEncryption.S3_MANAGED,
+      versioned: false,
+      cors: [
+        {
+          // WHY CORS: the browser needs to PUT directly to S3 using the presigned URL. Without CORS, browser blocks the cross-origin S3 request.
+          allowedMethods: [s3.HttpMethods.PUT],
+          allowedOrigins: [frontendUrl, "http://localhost:3000"],
+          allowedHeaders: ["*"],
+          maxAge: 3000,
+        },
+      ],
+    })
+
+    // SSM: store bucket name so Lambdas can find it
+    new ssm.StringParameter(this, "RawDocsBucketParam", {
+      parameterName: `/${config.stack_name_base}/rag/docs-bucket-name`,
+      stringValue: rawDocsBucket.bucketName,
+      description: "S3 bucket for raw uploaded documents",
+    })
+
+    // 2. DYNAMODB DOCUMENTS TABLE
+    // DynamoDB stores the metadata ABOUT the file.
+    const docsTable = new dynamodb.Table(this, "DocumentsTable", {
+      tableName: `${config.stack_name_base}-documents`,
+      partitionKey: {
+        name: "PK",
+        type: dynamodb.AttributeType.STRING,
+      },
+      sortKey: {
+        name: "SK",
+        type: dynamodb.AttributeType.STRING,
+      },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      encryption: dynamodb.TableEncryption.AWS_MANAGED,
+      pointInTimeRecoverySpecification: {
+        pointInTimeRecoveryEnabled: true, 
+      },
+    })
+
+    // GSI: query all docs for a tenant (for the "list my documents" page)
+    // The main table key is PK+SK which requires knowing docId.
+    // To list ALL docs for a tenant, need a secondary index on tenantId.
+    docsTable.addGlobalSecondaryIndex({
+      indexName: "tenantId-updatedAt-index",
+      partitionKey: {
+        name: "tenantId",
+        type: dynamodb.AttributeType.STRING,
+      },
+      sortKey: {
+        name: "updatedAt",
+        type: dynamodb.AttributeType.STRING,
+      },
+      projectionType: dynamodb.ProjectionType.ALL,
+    })
+
+    // SSM: store table name so Lambdas can find it
+    new ssm.StringParameter(this, "DocsTableParam", {
+      parameterName: `/${config.stack_name_base}/rag/docs-table-name`,
+      stringValue: docsTable.tableName,
+      description: "DynamoDB table for document inventory and versions",
+    })
+
+    // 3. PRESIGN UPLOAD LAMBDA
+    // The frontend cannot talk to S3 directly (no AWS creds).
+    const presignLambda = new PythonFunction(this, "PresignUploadLambda", {
+      functionName: `${config.stack_name_base}-presign-upload`,
+      runtime: lambda.Runtime.PYTHON_3_13,
+      architecture: lambda.Architecture.ARM_64,
+      bundling: {
+        platform: "linux/arm64",
+      },
+      entry: path.join(__dirname, "..", "lambdas", "presign-upload"),
+      handler: "handler",
+      timeout: cdk.Duration.seconds(30),
+      environment: {
+        DOCS_BUCKET_NAME: rawDocsBucket.bucketName,
+        DOCS_TABLE_NAME:  docsTable.tableName,
+        AWS_ACCOUNT_ID:   cdk.Aws.ACCOUNT_ID,
+      },
+      logGroup: new logs.LogGroup(this, "PresignLambdaLogGroup", {
+        logGroupName: `/aws/lambda/${config.stack_name_base}-presign-upload`,
+        retention: logs.RetentionDays.ONE_WEEK,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      }),
+    })
+
+    // Grant Lambda permission to generate presigned URLs for this bucket
+    rawDocsBucket.grantPut(presignLambda)
+
+    // Grant Lambda permission to read/write DynamoDB records
+    docsTable.grantReadWriteData(presignLambda)
+
+    // 4. API GATEWAY ROUTE: POST /documents/presign
+    //
+    // Cognito authorizer: only logged-in users can call this.
+    // Later: we derive tenantId FROM the JWT token instead of
+    // trusting the request body (more secure).
+    // ============================================================
+    const docsApi = new apigateway.RestApi(this, "DocsApi", {
+      restApiName: `${config.stack_name_base}-docs-api`,
+      description: "Document management API for RAG upload and ingestion",
+      defaultCorsPreflightOptions: {
+        allowOrigins: [frontendUrl, "http://localhost:3000"],
+        allowMethods: ["POST", "GET", "OPTIONS"],
+        allowHeaders: ["Content-Type", "Authorization"],
+      },
+      deployOptions: {
+        stageName: "prod",
+        loggingLevel: apigateway.MethodLoggingLevel.INFO,
+        metricsEnabled: true,
+        tracingEnabled: true,
+        accessLogDestination: new apigateway.LogGroupLogDestination(
+          new logs.LogGroup(this, "DocsApiAccessLogGroup", {
+            logGroupName: `/aws/apigateway/${config.stack_name_base}-docs-api-access`,
+            retention: logs.RetentionDays.ONE_WEEK,
+            removalPolicy: cdk.RemovalPolicy.DESTROY,
+          })
+        ),
+        accessLogFormat: apigateway.AccessLogFormat.jsonWithStandardFields(),
+      },
+    })
+
+    const docsRequestValidator = new apigateway.RequestValidator(
+      this,
+      "DocsApiRequestValidator",
+      {
+        restApi: docsApi,
+        requestValidatorName: `${config.stack_name_base}-docs-request-validator`,
+        validateRequestBody: true,
+        validateRequestParameters: true,
+      }
+    )
+
+    // Cognito authorizer — same user pool as feedback API
+    const docsAuthorizer = new apigateway.CognitoUserPoolsAuthorizer(
+      this,
+      "DocsApiAuthorizer",
+      {
+        cognitoUserPools: [this.userPool],
+        identitySource: "method.request.header.Authorization",
+        authorizerName: `${config.stack_name_base}-docs-authorizer`,
+      }
+    )
+
+    // Route: POST /documents/presign
+    // WHY /documents as parent resource: later we add
+    //   POST /documents/ingest   (Phase 2C)
+    //   GET  /documents          (Phase 2F list docs)
+    //   GET  /documents/{docId}  (Phase 2F get versions)
+    const documentsResource = docsApi.root.addResource("documents")
+    const presignResource   = documentsResource.addResource("presign")
+
+    presignResource.addMethod(
+      "POST",
+      new apigateway.LambdaIntegration(presignLambda),
+      {
+        authorizer: docsAuthorizer,
+        authorizationType: apigateway.AuthorizationType.COGNITO,
+        requestValidator: docsRequestValidator,
+      }
+    )
+
+    // SSM: store docs API URL for frontend
+    new ssm.StringParameter(this, "DocsApiUrlParam", {
+      parameterName: `/${config.stack_name_base}/rag/docs-api-url`,
+      stringValue: docsApi.url,
+      description: "Docs API Gateway URL for document management",
+    })
+
+    // Output: visible in CloudFormation after deploy
+    new cdk.CfnOutput(this, "DocsApiUrl", {
+      value: docsApi.url,
+      description: "Document management API URL",
+    })
+
+    new cdk.CfnOutput(this, "RawDocsBucketName", {
+      value: rawDocsBucket.bucketName,
+      description: "S3 bucket for raw uploaded documents",
     })
   }
 
