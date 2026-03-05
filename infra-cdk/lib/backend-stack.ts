@@ -675,7 +675,7 @@ export class BackendStack extends cdk.NestedStack {
 
   private createDocumentUploadInfra(config: AppConfig, frontendUrl: string): void {
     const rawDocsBucket = new s3.Bucket(this, "RawDocsBucket", {
-      bucketName: `${config.stack_name_base}-raw-docs-${cdk.Aws.ACCOUNT_ID}`.toLowerCase(),
+      bucketName: `${config.stack_name_base}-raw-docs`.toLowerCase(),
       removalPolicy: cdk.RemovalPolicy.DESTROY,
       autoDeleteObjects: true,
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
@@ -747,12 +747,12 @@ export class BackendStack extends cdk.NestedStack {
     const presignLambda = new PythonFunction(this, "PresignUploadLambda", {
       functionName: `${config.stack_name_base}-presign-upload`,
       runtime: lambda.Runtime.PYTHON_3_13,
+      entry: path.join(__dirname, "..", "lambdas", "presign-upload"),
+      handler: "handler",
       architecture: lambda.Architecture.ARM_64,
       bundling: {
         platform: "linux/arm64",
       },
-      entry: path.join(__dirname, "..", "lambdas", "presign-upload"),
-      handler: "handler",
       timeout: cdk.Duration.seconds(30),
       environment: {
         DOCS_BUCKET_NAME: rawDocsBucket.bucketName,
