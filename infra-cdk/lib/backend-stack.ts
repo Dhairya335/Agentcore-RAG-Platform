@@ -97,6 +97,9 @@ export class BackendStack extends cdk.NestedStack {
     // Create Opensearch serveless Collections for Vector DB
     this.createVectorStore(props.config)
 
+    // Phase 2B: Document upload infrastructure
+    this.createDocumentUploadInfra(props.config, props.frontendUrl)
+
   }
 
   private createAgentCoreRuntime(config: AppConfig): void {
@@ -502,36 +505,36 @@ export class BackendStack extends cdk.NestedStack {
      * API Gateway defaultCorsPreflightOptions below only handles OPTIONS preflight requests.
      * See detailed explanation and fix options in: infra-cdk/lambdas/feedback/index.py
      */
-    const api = new apigateway.RestApi(this, "FeedbackApi", {
-      restApiName: `${config.stack_name_base}-api`,
-      description: "API for user feedback and future endpoints",
-      defaultCorsPreflightOptions: {
-        allowOrigins: [frontendUrl, "http://localhost:3000"],
-        allowMethods: ["POST", "OPTIONS"],
-        allowHeaders: ["Content-Type", "Authorization"],
-      },
-      deployOptions: {
-        stageName: "prod",
-        throttlingRateLimit: 100,
-        throttlingBurstLimit: 200,
-        cachingEnabled: true,
-        cacheClusterEnabled: true,
-        cacheClusterSize: "0.5",
-        cacheTtl: cdk.Duration.minutes(5),
-        loggingLevel: apigateway.MethodLoggingLevel.INFO,
-        dataTraceEnabled: true,
-        metricsEnabled: true,
-        accessLogDestination: new apigateway.LogGroupLogDestination(
-          new logs.LogGroup(this, "FeedbackApiAccessLogGroup", {
-            logGroupName: `/aws/apigateway/${config.stack_name_base}-api-access`,
-            retention: logs.RetentionDays.ONE_WEEK,
-            removalPolicy: cdk.RemovalPolicy.DESTROY,
-          })
-        ),
-        accessLogFormat: apigateway.AccessLogFormat.jsonWithStandardFields(),
-        tracingEnabled: true,
-      },
-    })
+    // const api = new apigateway.RestApi(this, "FeedbackApi", {
+    //   restApiName: `${config.stack_name_base}-api`,
+    //   description: "API for user feedback and future endpoints",
+    //   defaultCorsPreflightOptions: {
+    //     allowOrigins: [frontendUrl, "http://localhost:3000"],
+    //     allowMethods: ["POST", "OPTIONS"],
+    //     allowHeaders: ["Content-Type", "Authorization"],
+    //   },
+    //   deployOptions: {
+    //     stageName: "prod",
+    //     throttlingRateLimit: 100,
+    //     throttlingBurstLimit: 200,
+    //     // cachingEnabled: true,
+    //     // cacheClusterEnabled: true,
+    //     // cacheClusterSize: "0.5",
+    //     cacheTtl: cdk.Duration.minutes(5),
+    //     loggingLevel: apigateway.MethodLoggingLevel.INFO,
+    //     dataTraceEnabled: true,
+    //     metricsEnabled: true,
+    //     accessLogDestination: new apigateway.LogGroupLogDestination(
+    //       new logs.LogGroup(this, "FeedbackApiAccessLogGroup", {
+    //         logGroupName: `/aws/apigateway/${config.stack_name_base}-api-access`,
+    //         retention: logs.RetentionDays.ONE_WEEK,
+    //         removalPolicy: cdk.RemovalPolicy.DESTROY,
+    //       })
+    //     ),
+    //     accessLogFormat: apigateway.AccessLogFormat.jsonWithStandardFields(),
+    //     tracingEnabled: true,
+    //   },
+    // })
 
     // Add request validator for API security
     const requestValidator = new apigateway.RequestValidator(this, "FeedbackApiRequestValidator", {
