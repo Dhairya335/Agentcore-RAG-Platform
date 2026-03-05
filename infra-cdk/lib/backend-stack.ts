@@ -13,6 +13,7 @@ import { PythonFunction } from "@aws-cdk/aws-lambda-python-alpha"
 import * as lambda from "aws-cdk-lib/aws-lambda"
 import * as ecr_assets from "aws-cdk-lib/aws-ecr-assets"
 import * as cr from "aws-cdk-lib/custom-resources"
+import * as opensearchserverless from 'aws-cdk-lib/aws-opensearchserverless'
 import { Construct } from "constructs"
 import { AppConfig } from "./utils/config-manager"
 import { AgentCoreRole } from "./utils/agentcore-role"
@@ -92,6 +93,10 @@ export class BackendStack extends cdk.NestedStack {
     // Create API Gateway Feedback API resources (example of best-practice API Gateway + Lambda
     // pattern)
     this.createFeedbackApi(props.config, props.frontendUrl, feedbackTable)
+
+    // Create Opensearch serveless Collections for Vector DB
+    this.createVectorStore(props.config)
+
   }
 
   private createAgentCoreRuntime(config: AppConfig): void {
@@ -552,6 +557,110 @@ export class BackendStack extends cdk.NestedStack {
       parameterName: `/${config.stack_name_base}/feedback-api-url`,
       stringValue: api.url,
       description: "Feedback API Gateway URL",
+    })
+  }
+
+  private createVectorStore(config: AppConfig): void {
+    const encryptionPolicy = new opensearchserverless.CfnSecurityPolicy(this, 'OSSEncryptionPolicy', {
+      name: `${config.stack_name_base}-rag-enc`.toLowerCase(),
+      type: 'encryption',
+      policy: JSON.stringify({
+        Rules: [{
+          ResourceType: 'collection',
+          Resource: [`collection/${config.stack_name_base}-rag-vectors`.toLowerCase()]
+        }],
+        AWSOwnedKey: true,
+      }),
+    })
+
+    // Built-in: opensearchserverless.CfnSecurityPolicy (L1/Cfn)
+    // Why: Controls network access. AllowFromPublic: true = 
+    const networkPolicy = new opensearchserverless.CfnSecurityPolicy(this, 'OSSNetworkPolicy', {
+      name: `${config.stack_name_base}-rag-net`.toLowerCase(),
+      type: 'network',
+      policy: JSON.stringify([{
+        Rules: [
+          {
+            ResourceType: 'collection',
+            Resource: [`collection/${config.stack_name_base}-rag-vectors`.toLowerCase()]
+          },
+          {
+            ResourceType: 'dashboard',
+            Resource: [`collection/${config.stack_name_base}-rag-vectors`.toLowerCase()]
+          },
+        ],
+        AllowFromPublic: true,
+      }]),
+    })
+
+    // Built-in: opensearchserverless.CfnCollection (L1/Cfn)
+    // Why VECTORSEARCH type: optimized for kNN similarity search —
+    // the algorithm that finds "semantically similar" text chunks.
+    const ossCollection = new opensearchserverless.CfnCollection(this, 'OSSVectorCollection', {
+      name: `${config.stack_name_base}-rag-vectors`.toLowerCase(),
+      type: 'VECTORSEARCH',
+      description: `Vector store for ${config.stack_name_base} RAG chatbot`,
+    })
+    ossCollection.addDependency(encryptionPolicy)
+    ossCollection.addDependency(networkPolicy)
+
+    // Built-in: opensearchserverless.CfnAccessPolicy (L1/Cfn)
+    // Why separate from IAM: OpenSearch Serverless has TWO layers:
+    //   Layer 1 - IAM: can you call AWS APIs? (create collection etc)
+    //   Layer 2 - Data Access: can you read/write actual documents
+    new opensearchserverless.CfnAccessPolicy(this, 'OSSDataAccessPolicy', {
+      name: `${config.stack_name_base}-rag-access`.toLowerCase(),
+      type: 'data',
+      policy: JSON.stringify([{
+        Rules: [
+          {
+            ResourceType: 'index',
+            Resource: [`index/${config.stack_name_base}-rag-vectors/*`.toLowerCase()],
+            Permission: [
+              'aoss:CreateIndex',    
+              'aoss:DeleteIndex',    
+              'aoss:UpdateIndex',    
+              'aoss:DescribeIndex',  
+              'aoss:ReadDocument',   
+              'aoss:WriteDocument', 
+            ],
+          },
+          {
+            ResourceType: 'collection',
+            Resource: [`collection/${config.stack_name_base}-rag-vectors`.toLowerCase()],
+            Permission: [
+              'aoss:CreateCollectionItems',
+              'aoss:DescribeCollectionItems',
+            ],
+          },
+        ],
+        Principal: [
+          `arn:aws:iam::${cdk.Stack.of(this).account}:root`,
+        ],
+      }]),
+    })
+
+    // Built-in: ssm.StringParameter (L2 — friendly wrapper exists)
+    // Why SSM: every Lambda needs the endpoint URL to connect.
+    // Store once here, read from anywhere. No hardcoding in Lambda.
+    new ssm.StringParameter(this, 'OSSEndpointParam', {
+      parameterName: `/${config.stack_name_base}/rag/opensearch-endpoint`,
+      stringValue: ossCollection.attrCollectionEndpoint,
+      description: 'OpenSearch Serverless collection endpoint for RAG',
+    })
+
+    new ssm.StringParameter(this, 'OSSIndexNameParam', {
+      parameterName: `/${config.stack_name_base}/rag/opensearch-index-name`,
+      stringValue: 'fast-chunks-v1',
+      description: 'OpenSearch index name for document chunks',
+    })
+
+    // Built-in: cdk.CfnOutput
+    // Why: Prints the endpoint URL in CloudFormation console after
+    new cdk.CfnOutput(this, 'OSSCollectionEndpoint', {
+      value: ossCollection.attrCollectionEndpoint,
+      description: 'OpenSearch Serverless collection endpoint',
+      exportName: `${config.stack_name_base}-OSSCollectionEndpoint`,
     })
   }
 
