@@ -461,31 +461,38 @@ export class BackendStack extends cdk.NestedStack {
   ): void {
     // Create Lambda function for feedback using Python
     const feedbackLambda = new PythonFunction(this, "FeedbackLambda", {
-      functionName: `${config.stack_name_base}-feedback`,
+    functionName: `${config.stack_name_base}-feedback`,
       runtime: lambda.Runtime.PYTHON_3_13,
       entry: path.join(__dirname, "..", "lambdas", "feedback"),
       handler: "handler",
+
+      architecture: lambda.Architecture.ARM_64,
+
+      bundling: {
+        platform: "linux/arm64",
+      },
+
       environment: {
         TABLE_NAME: feedbackTable.tableName,
         CORS_ALLOWED_ORIGINS: `${frontendUrl},http://localhost:3000`,
       },
+
       timeout: cdk.Duration.seconds(30),
+
       layers: [
         lambda.LayerVersion.fromLayerVersionArn(
           this,
           "PowertoolsLayer",
-          `arn:aws:lambda:${
-            cdk.Stack.of(this).region
-          }:017000801446:layer:AWSLambdaPowertoolsPythonV3-python313-arm64:18`
+          `arn:aws:lambda:${cdk.Stack.of(this).region}:017000801446:layer:AWSLambdaPowertoolsPythonV3-python313-arm64:18`
         ),
       ],
+
       logGroup: new logs.LogGroup(this, "FeedbackLambdaLogGroup", {
         logGroupName: `/aws/lambda/${config.stack_name_base}-feedback`,
         retention: logs.RetentionDays.ONE_WEEK,
         removalPolicy: cdk.RemovalPolicy.DESTROY,
       }),
     })
-
     // Grant Lambda permissions to write to DynamoDB
     feedbackTable.grantWriteData(feedbackLambda)
 
