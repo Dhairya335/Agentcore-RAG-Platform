@@ -571,105 +571,128 @@ export class BackendStack extends cdk.NestedStack {
   }
 
   private createVectorStore(config: AppConfig): void {
+    const collectionName = `${config.stack_name_base}-rag-vectors`.toLowerCase()
+    
+    // Encryption policy: OSS requires this BEFORE a collection can be created
     const encryptionPolicy = new opensearchserverless.CfnSecurityPolicy(this, 'OSSEncryptionPolicy', {
       name: `${config.stack_name_base}-rag-enc`.toLowerCase(),
       type: 'encryption',
       policy: JSON.stringify({
         Rules: [{
           ResourceType: 'collection',
-          Resource: [`collection/${config.stack_name_base}-rag-vectors`.toLowerCase()]
+          Resource: [`collection/${collectionName}`]
         }],
         AWSOwnedKey: true,
       }),
     })
 
-    // Built-in: opensearchserverless.CfnSecurityPolicy (L1/Cfn)
-    // Why: Controls network access. AllowFromPublic: true = 
+    // Network policy: allows public HTTPS access to the collection endpoint
     const networkPolicy = new opensearchserverless.CfnSecurityPolicy(this, 'OSSNetworkPolicy', {
       name: `${config.stack_name_base}-rag-net`.toLowerCase(),
       type: 'network',
       policy: JSON.stringify([{
         Rules: [
-          {
-            ResourceType: 'collection',
-            Resource: [`collection/${config.stack_name_base}-rag-vectors`.toLowerCase()]
-          },
-          {
-            ResourceType: 'dashboard',
-            Resource: [`collection/${config.stack_name_base}-rag-vectors`.toLowerCase()]
-          },
+          { ResourceType: 'collection', Resource: [`collection/${collectionName}`] },
+          { ResourceType: 'dashboard',  Resource: [`collection/${collectionName}`] },
         ],
         AllowFromPublic: true,
       }]),
     })
 
-    // Built-in: opensearchserverless.CfnCollection (L1/Cfn)
-    // VECTORSEARCH type: optimized for kNN similarity search - the algorithm that finds "semantically similar" text chunks.
-    const ossCollection = new opensearchserverless.CfnCollection(this, 'OSSVectorCollection', {
-      name: `${config.stack_name_base}-rag-vectors`.toLowerCase(),
-      type: 'VECTORSEARCH',
-      description: `Vector store for ${config.stack_name_base} RAG chatbot`,
-    })
-    ossCollection.addDependency(encryptionPolicy)
-    ossCollection.addDependency(networkPolicy)
-
-    // Built-in: opensearchserverless.CfnAccessPolicy (L1/Cfn)
-    // Separate from IAM: OpenSearch Serverless has TWO layers:
-    //   Layer 1 - IAM: can you call AWS APIs? (create collection etc)
-    //   Layer 2 - Data Access: can you read/write actual documents
-    new opensearchserverless.CfnAccessPolicy(this, 'OSSDataAccessPolicy', {
+    // Data access policy: what IAM principals can read/write actual documents
+    const dataAccessPolicy = new opensearchserverless.CfnAccessPolicy(this, 'OSSDataAccessPolicy', {
       name: `${config.stack_name_base}-rag-access`.toLowerCase(),
       type: 'data',
       policy: JSON.stringify([{
         Rules: [
           {
             ResourceType: 'index',
-            Resource: [`index/${config.stack_name_base}-rag-vectors/*`.toLowerCase()],
+            Resource: [`index/${collectionName}/*`],
             Permission: [
-              'aoss:CreateIndex',    
-              'aoss:DeleteIndex',    
-              'aoss:UpdateIndex',    
-              'aoss:DescribeIndex',  
-              'aoss:ReadDocument',   
-              'aoss:WriteDocument', 
+              'aoss:CreateIndex',
+              'aoss:DeleteIndex',
+              'aoss:UpdateIndex',
+              'aoss:DescribeIndex',
+              'aoss:ReadDocument',
+              'aoss:WriteDocument',
             ],
           },
           {
             ResourceType: 'collection',
-            Resource: [`collection/${config.stack_name_base}-rag-vectors`.toLowerCase()],
+            Resource: [`collection/${collectionName}`],
             Permission: [
               'aoss:CreateCollectionItems',
               'aoss:DescribeCollectionItems',
             ],
           },
         ],
-        Principal: [
-          `arn:aws:iam::${cdk.Stack.of(this).account}:root`,
-        ],
+        Principal: [`arn:aws:iam::${cdk.Stack.of(this).account}:root`],
       }]),
     })
 
-    // Built-in: ssm.StringParameter (L2 — friendly wrapper exists)
-    // Why SSM: every Lambda needs the endpoint URL to connect.
-    // Store once here, read from anywhere. No hardcoding in Lambda.
+    const ossManagerLambda = new lambda.Function(this, 'OSSManagerLambda', {
+      functionName:  `${config.stack_name_base}-oss-manager`,
+      runtime:       lambda.Runtime.PYTHON_3_13,
+      code:          lambda.Code.fromAsset(
+        path.join(__dirname, '..', 'lambdas', 'oss-collection-manager')
+      ),
+      handler:       'index.handler',
+      architecture:  lambda.Architecture.ARM_64,
+      // WHY 15 minutes: OSS collections take 2-5 min to become ACTIVE.
+      // Lambda must stay alive during that wait.
+      timeout: cdk.Duration.minutes(15),
+      logGroup: new logs.LogGroup(this, 'OSSManagerLogGroup', {
+        logGroupName:    `/aws/lambda/${config.stack_name_base}-oss-manager`,
+        retention:       logs.RetentionDays.ONE_WEEK,
+        removalPolicy:   cdk.RemovalPolicy.DESTROY,
+      }),
+    })
+
+    ossManagerLambda.addToRolePolicy(new iam.PolicyStatement({
+      effect:    iam.Effect.ALLOW,
+      actions: [
+        'aoss:CreateCollection',
+        'aoss:DeleteCollection',
+        'aoss:ListCollections',
+        'aoss:BatchGetCollection',
+      ],
+      resources: ['*'],  // OSS collection ARNs are unknown before creation
+    }))
+
+    const ossCustomResource = new cdk.CustomResource(this, 'OSSCollectionResource', {
+      serviceToken: ossManagerLambda.functionArn,
+      // These are the properties your Lambda receives under event.ResourceProperties
+      properties: {
+        CollectionName: collectionName,
+        // Changing this triggers an Update event on the next deploy.
+        // Useful if you want to force a re-check. For now, keeping static.
+        Version: '1',
+      },
+    })
+
+    ossCustomResource.node.addDependency(encryptionPolicy)
+    ossCustomResource.node.addDependency(networkPolicy)
+    ossCustomResource.node.addDependency(dataAccessPolicy)
+
+    // Get the endpoint from the Lambda's response Data object
+    const collectionEndpoint = ossCustomResource.getAttString('CollectionEndpoint')
+
     new ssm.StringParameter(this, 'OSSEndpointParam', {
       parameterName: `/${config.stack_name_base}/rag/opensearch-endpoint`,
-      stringValue: ossCollection.attrCollectionEndpoint,
-      description: 'OpenSearch Serverless collection endpoint for RAG',
+      stringValue:   collectionEndpoint,
+      description:   'OpenSearch Serverless collection endpoint for RAG',
     })
 
     new ssm.StringParameter(this, 'OSSIndexNameParam', {
       parameterName: `/${config.stack_name_base}/rag/opensearch-index-name`,
-      stringValue: 'fast-chunks-v1',
-      description: 'OpenSearch index name for document chunks',
+      stringValue:   'fast-chunks-v1',
+      description:   'OpenSearch index name for document chunks',
     })
 
-    // Built-in: cdk.CfnOutput
-    // Why: Prints the endpoint URL in CloudFormation console after
     new cdk.CfnOutput(this, 'OSSCollectionEndpoint', {
-      value: ossCollection.attrCollectionEndpoint,
+      value:       collectionEndpoint,
       description: 'OpenSearch Serverless collection endpoint',
-      exportName: `${config.stack_name_base}-OSSCollectionEndpoint`,
+      exportName:  `${config.stack_name_base}-OSSCollectionEndpoint`,
     })
   }
 
