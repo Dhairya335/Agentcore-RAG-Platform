@@ -3,7 +3,7 @@
 import { FormEvent, KeyboardEvent, useRef, useEffect } from "react"
 import { Button } from "@/components/ui/button"
 import { Textarea } from "@/components/ui/textarea"
-import { Loader2Icon, Send } from "lucide-react"
+import { Loader2Icon, Paperclip, Send } from "lucide-react"
 
 interface ChatInputProps {
   input: string
@@ -11,6 +11,9 @@ interface ChatInputProps {
   handleSubmit: (e: FormEvent) => void
   isLoading: boolean
   className?: string
+  // ── NEW: upload panel toggle ──────────────────────────────────────
+  onUploadClick?: () => void
+  isUploadPanelOpen?: boolean
 }
 
 export function ChatInput({
@@ -19,6 +22,9 @@ export function ChatInput({
   handleSubmit,
   isLoading,
   className = "",
+  // ── NEW ──────────────────────────────────────────────────────────
+  onUploadClick,
+  isUploadPanelOpen = false,
 }: ChatInputProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null)
 
@@ -36,11 +42,9 @@ export function ChatInput({
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter") {
       if (e.ctrlKey) {
-        // Add a new line when Ctrl+Enter is pressed
         setInput(`${input}\n\n`)
         e.preventDefault()
       } else if (!e.shiftKey) {
-        // Submit the form when Enter is pressed without Shift
         if (input.trim()) {
           e.preventDefault()
           handleSubmit(e as unknown as FormEvent)
@@ -55,6 +59,25 @@ export function ChatInput({
         onSubmit={handleSubmit}
         className="flex space-x-2 w-full items-end bg-white rounded-lg shadow-lg border border-gray-200 p-3"
       >
+        {/* ── NEW: Paperclip button ─────────────────────────────────── */}
+        {onUploadClick && (
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            onClick={onUploadClick}
+            className={`h-10 w-10 flex-shrink-0 transition-colors ${
+              isUploadPanelOpen
+                ? "text-blue-600 bg-blue-50 hover:bg-blue-100"
+                : "text-gray-400 hover:text-gray-600"
+            }`}
+            aria-label={isUploadPanelOpen ? "Close upload panel" : "Upload document"}
+            title="Upload a document"
+          >
+            <Paperclip className="h-4 w-4" />
+          </Button>
+        )}
+
         <Textarea
           ref={textareaRef}
           value={input}
