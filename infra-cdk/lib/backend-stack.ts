@@ -33,6 +33,7 @@ export class BackendStack extends cdk.NestedStack {
   public readonly userPoolClientId: string
   public readonly userPoolDomain: cognito.UserPoolDomain
   public feedbackApiUrl: string
+  public docsApiUrl: string
   public runtimeArn: string
   public memoryArn: string
   private agentName: cdk.CfnParameter
@@ -866,6 +867,7 @@ export class BackendStack extends cdk.NestedStack {
     )
 
     // SSM: store docs API URL for frontend
+    this.docsApiUrl = docsApi.url   // ← ADD THIS LINE
     new ssm.StringParameter(this, "DocsApiUrlParam", {
       parameterName: `/${config.stack_name_base}/rag/docs-api-url`,
       stringValue: docsApi.url,
