@@ -1,10 +1,8 @@
 import * as cdk from "aws-cdk-lib"
 import * as amplify from "@aws-cdk/aws-amplify-alpha"
 import * as s3 from "aws-cdk-lib/aws-s3"
-import * as s3deploy from "aws-cdk-lib/aws-s3-deployment"
 import * as iam from "aws-cdk-lib/aws-iam"
 import * as lambda from "aws-cdk-lib/aws-lambda"
-import * as logs from "aws-cdk-lib/aws-logs"
 import { Construct } from "constructs"
 import { AppConfig } from "./utils/config-manager"
 import * as path from "path"
@@ -117,16 +115,6 @@ export class AmplifyHostingStack extends cdk.NestedStack {
       )
     }
 
-    const frontendDeployment = new s3deploy.BucketDeployment(this, "FrontendZipUpload", {
-      sources: [
-        // Pre-built frontend zip — plain asset, no bundling, no Docker
-        s3deploy.Source.asset(frontendZipPath),
-      ],
-      destinationBucket: this.stagingBucket,
-      destinationKeyPrefix: "frontend/",
-      retainOnDelete: false,
-    })
-
     // Frontend Deployer Lambda + Custom Resource
     // WHY a Custom Resource Lambda:
     //   After the zip is in S3, need tocall Amplify's API to
@@ -149,6 +137,7 @@ export class AmplifyHostingStack extends cdk.NestedStack {
       architecture: lambda.Architecture.ARM_64,
 
       timeout: cdk.Duration.minutes(5),
+
     })
 
     this.stagingBucket.grantRead(deployerLambda)
@@ -191,7 +180,7 @@ export class AmplifyHostingStack extends cdk.NestedStack {
       },
     })
 
-    deployerResource.node.addDependency(frontendDeployment)
+    deployerResource.node.addDependency(this.stagingBucket)
 
     new cdk.CfnOutput(this, "AmplifyUrl", {
       value:       this.amplifyUrl,
