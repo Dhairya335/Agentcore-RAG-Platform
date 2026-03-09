@@ -121,46 +121,29 @@ export class AmplifyHostingStack extends cdk.NestedStack {
       agentPattern:                 props.agentPattern,
     }, null, 2)
 
-    // Build frontend + upload zip + aws-exports.json to staging S3 bucket.
+    // Upload pre-built frontend zip + generated aws-exports.json to staging S3.
     //
-    // WHY no Docker: Docker on EC2 runs as a different user and gets
-    // permission denied (exit 243) writing to the CDK asset output dir.
-    // Local bundling runs npm directly on this machine — simpler and reliable.
-    const frontendDir = path.join(__dirname, "../../frontend")
+    // The zip is built BEFORE cdk deploy via: make build-frontend
+    // (or: cd frontend && npm run build && cd build && python3 -c "import shutil; shutil.make_archive('../../../infra-cdk/frontend-build', 'zip', '.')")
+    // This produces infra-cdk/frontend-build.zip which CDK uploads as a plain asset.
+    //
+    // No bundling, no Docker — CDK just treats it as a static file upload.
+    const frontendZipPath = path.join(__dirname, "..", "frontend-build.zip")
+
+    // Fail fast at synth time if zip is missing — tells you exactly what to run
+    const fs = require("fs")
+    if (!fs.existsSync(frontendZipPath)) {
+      throw new Error(
+        `\nfrontend-build.zip not found. Build it first:\n` +
+        `  cd infra-cdk && make build-frontend\n`
+      )
+    }
 
     const frontendDeployment = new s3deploy.BucketDeployment(this, "FrontendZipUpload", {
       sources: [
-        // Source 1: build the frontend locally and zip the output
-        s3deploy.Source.asset(frontendDir, {
-          bundling: {
-            // Dummy image — required by CDK API but never used
-            // because local.tryBundle handles everything
-            image: cdk.DockerImage.fromRegistry("scratch"),
-            local: {
-              tryBundle(outputDir: string): boolean {
-                try {
-                  const { execSync } = require("child_process")
-                  // Step 1: build the React app
-                  execSync("npm run build", {
-                    cwd: frontendDir,
-                    stdio: "inherit",
-                    env: { ...process.env },
-                  })
-                  // Step 2: zip build output into CDK asset staging dir
-                  execSync(
-                    `cd ${frontendDir}/build && zip -r ${outputDir}/frontend-build.zip .`,
-                    { stdio: "inherit" }
-                  )
-                  return true
-                } catch (e) {
-                  console.error("Frontend local bundling failed:", e)
-                  return false
-                }
-              },
-            },
-          },
-        }),
-
+        // Source 1: pre-built frontend zip — plain asset, no bundling
+        s3deploy.Source.asset(frontendZipPath),
+        // Source 2: generated aws-exports.json — always in sync with deployed infra
         s3deploy.Source.jsonData("aws-exports.json", JSON.parse(awsExportsContent)),
       ],
       destinationBucket: this.stagingBucket,

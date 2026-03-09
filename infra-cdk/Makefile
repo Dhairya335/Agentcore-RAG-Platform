@@ -49,15 +49,12 @@ ZIP_PATH = frontend-build.zip
 
 .PHONY: deploy build-frontend clean
 
-deploy: build-frontend
-	cdk deploy --profile $(PROFILE)
-
 build-frontend:
-	@echo "Building frontend..."
-	cd $(FRONTEND_DIR) && npm run build
-	@echo "Zipping build output..."
-	cd $(FRONTEND_DIR)/build && zip -r ../../infra-cdk/$(ZIP_PATH) . --quiet
-	@echo "frontend-build.zip ready."
+    cd ../frontend && npm run build
+    cd ../frontend/build && python3 -c "import shutil; shutil.make_archive('../../infra-cdk/frontend-build', 'zip', '.')"
+
+deploy: build-frontend
+    cdk deploy --profile $(PROFILE)   
 
 clean:
 	rm -f $(ZIP_PATH)
