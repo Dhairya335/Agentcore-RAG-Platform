@@ -131,7 +131,9 @@ export class AmplifyHostingStack extends cdk.NestedStack {
     const deployerLambda = new lambda.Function(this, "FrontendDeployerLambda", {
       functionName: `${props.config.stack_name_base}-frontend-deployer`,
       runtime:      lambda.Runtime.PYTHON_3_13,
-      code:         lambda.Code.fromAsset(...),
+      code: lambda.Code.fromAsset(
+        path.join(__dirname, "..", "lambdas", "frontend-deployer")
+      ),
       handler:      "index.handler",
       architecture: lambda.Architecture.ARM_64,
       timeout:      cdk.Duration.minutes(5),
