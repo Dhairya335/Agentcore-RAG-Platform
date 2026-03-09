@@ -4,8 +4,9 @@ import uuid
 import boto3
 from datetime import datetime, timezone
 
-s3       = boto3.client("s3")
-dynamodb = boto3.resource("dynamodb")
+s3              = boto3.client("s3")
+dynamodb        = boto3.resource("dynamodb")   # high-level: used for table.get_item
+dynamodb_client = boto3.client("dynamodb")     # low-level: used for transact_write_items
 
 BUCKET_NAME = os.environ["DOCS_BUCKET_NAME"]
 TABLE_NAME  = os.environ["DOCS_TABLE_NAME"]
@@ -86,7 +87,7 @@ def handler(event, context):
     now = datetime.now(timezone.utc).isoformat()
 
     try:
-        dynamodb.meta.client.transact_write(
+        dynamodb_client.transact_write_items(
             TransactItems=[
 
                 # --- Record 1: Version history entry ---
@@ -136,7 +137,7 @@ def handler(event, context):
 
             ]
         )
-    except dynamodb.meta.client.exceptions.TransactionCanceledException as e:
+    except dynamodb_client.exceptions.TransactionCanceledException as e:
         return _error(409, f"Version conflict — document version already exists: {str(e)}")
     except Exception as e:
         return _error(500, f"Failed to write DynamoDB records: {str(e)}")
