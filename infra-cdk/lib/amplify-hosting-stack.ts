@@ -121,27 +121,48 @@ export class AmplifyHostingStack extends cdk.NestedStack {
       agentPattern:                 props.agentPattern,
     }, null, 2)
 
-    // Build frontend zip + aws-exports.json and push to staging S3 bucket
-    s3deploy.Source.asset(path.join(__dirname, "../../frontend"), {
-  bundling: {
-    image: cdk.DockerImage.fromRegistry("node:20-alpine"),
-    command: [
-      "sh", "-c",
-      "npm ci && npm run build && cd build && zip -r /asset-output/frontend-build.zip ."
-    ],
-    // Runs on your machine if Docker is available, otherwise in Lambda
-    local: {
-      tryBundle(outputDir) {
-        // Falls back to running npm locally if no Docker
-        const result = require("child_process").spawnSync(
-          "sh", ["-c", `cd ${path.join(__dirname, "../../frontend")} && npm run build && cd build && zip -r ${outputDir}/frontend-build.zip .`],
-          { stdio: "inherit" }
-        )
-        return result.status === 0
-      }
-    }
-  }
-})
+    // Build frontend + upload zip + aws-exports.json to staging S3 bucket.
+    //
+    // HOW BUNDLING WORKS:
+    //   CDK runs the `local.tryBundle` function first (no Docker needed).
+    //   It executes `npm run build` in your frontend folder, then zips
+    //   the build output into the CDK asset staging directory.
+    //   BucketDeployment then uploads that zip to the staging S3 bucket.
+    //   If local bundling fails, CDK falls back to Docker automatically.
+    const frontendDeployment = new s3deploy.BucketDeployment(this, "FrontendZipUpload", {
+      sources: [
+        // Source 1: build the frontend and zip it
+        s3deploy.Source.asset(path.join(__dirname, "../../frontend"), {
+          bundling: {
+            // Docker fallback — used in CI or if local bundling fails
+            image: cdk.DockerImage.fromRegistry("node:20-alpine"),
+            command: [
+              "sh", "-c",
+              "npm ci && npm run build && cd build && zip -r /asset-output/frontend-build.zip .",
+            ],
+            // Local bundling — runs npm directly on your machine (faster, no Docker)
+            local: {
+              tryBundle(outputDir: string): boolean {
+                const result = require("child_process").spawnSync(
+                  "sh",
+                  [
+                    "-c",
+                    `cd ${path.join(__dirname, "../../frontend")} && npm run build && cd build && zip -r ${outputDir}/frontend-build.zip .`,
+                  ],
+                  { stdio: "inherit" }
+                )
+                return result.status === 0
+              },
+            },
+          },
+        }),
+        // Source 2: inject generated aws-exports.json (always up to date with deployed infra)
+        s3deploy.Source.jsonData("aws-exports.json", JSON.parse(awsExportsContent)),
+      ],
+      destinationBucket: this.stagingBucket,
+      destinationKeyPrefix: "frontend/",
+      retainOnDelete: false,
+    })
 
     // Frontend Deployer Lambda + Custom Resource
     // WHY a Custom Resource Lambda:
@@ -196,13 +217,11 @@ export class AmplifyHostingStack extends cdk.NestedStack {
         BranchName:     "main",
         StagingBucket:  this.stagingBucket.bucketName,
         ZipKey:         "frontend/frontend-build.zip",
-        // Changing DeployVersion forces a re-deploy on next cdk deploy.
-        // Update this value whenever you want to push new frontend code.
-        DeployVersion:  "1",
+        DeployVersion:  "2",
       },
     })
 
-    deployerResource.node.addDependency(this.stagingBucket)
+    deployerResource.node.addDependency(frontendDeployment)
 
     new cdk.CfnOutput(this, "AmplifyUrl", {
       value:       this.amplifyUrl,
