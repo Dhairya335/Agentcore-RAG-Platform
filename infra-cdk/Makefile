@@ -42,7 +42,7 @@ lint-cicd:
 	fi
 	@echo -e "$(GREEN)All code quality checks passed!$(NC)"
 
-PROFILE = bedorck-agentcore-rag-sso
+PROFILE = bedrock-agentcore-rag
 FRONTEND_DIR = ../frontend
 ZIP_PATH = frontend-build.zip
 
