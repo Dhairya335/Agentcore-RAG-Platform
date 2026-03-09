@@ -11,6 +11,7 @@ model.tar.gz
 dist/
 .sav/
 .delete/
+.claude/
 .data/
 *.egg-info/
 build/
@@ -31,3 +32,4 @@ frontend/public/aws-exports.json
 scripts/zip-artifact/
 public/
 .mkdocs/public/
+

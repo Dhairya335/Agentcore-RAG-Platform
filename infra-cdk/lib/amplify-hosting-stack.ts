@@ -6,6 +6,7 @@ import * as lambda from "aws-cdk-lib/aws-lambda"
 import { Construct } from "constructs"
 import { AppConfig } from "./utils/config-manager"
 import * as path from "path"
+import * as logs from "aws-cdk-lib/aws-logs"
 
 export interface AmplifyStackProps extends cdk.NestedStackProps {
   config: AppConfig
@@ -130,14 +131,15 @@ export class AmplifyHostingStack extends cdk.NestedStack {
     const deployerLambda = new lambda.Function(this, "FrontendDeployerLambda", {
       functionName: `${props.config.stack_name_base}-frontend-deployer`,
       runtime:      lambda.Runtime.PYTHON_3_13,
-      code:         lambda.Code.fromAsset(
-        path.join(__dirname, "..", "lambdas", "frontend-deployer")
-      ),
+      code:         lambda.Code.fromAsset(...),
       handler:      "index.handler",
       architecture: lambda.Architecture.ARM_64,
-
-      timeout: cdk.Duration.minutes(5),
-
+      timeout:      cdk.Duration.minutes(5),
+      logGroup: logs.LogGroup.fromLogGroupName(
+        this,
+        "FrontendDeployerLambdaLogGroup",
+        `/aws/lambda/${props.config.stack_name_base}-frontend-deployer`
+      ),
     })
 
     this.stagingBucket.grantRead(deployerLambda)
