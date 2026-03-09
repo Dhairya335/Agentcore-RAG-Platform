@@ -42,3 +42,22 @@ lint-cicd:
 		exit 1; \
 	fi
 	@echo -e "$(GREEN)All code quality checks passed!$(NC)"
+
+PROFILE = bedorck-agentcore-rag-sso
+FRONTEND_DIR = ../frontend
+ZIP_PATH = frontend-build.zip
+
+.PHONY: deploy build-frontend clean
+
+deploy: build-frontend
+	cdk deploy --profile $(PROFILE)
+
+build-frontend:
+	@echo "Building frontend..."
+	cd $(FRONTEND_DIR) && npm run build
+	@echo "Zipping build output..."
+	cd $(FRONTEND_DIR)/build && zip -r ../../infra-cdk/$(ZIP_PATH) . --quiet
+	@echo "frontend-build.zip ready."
+
+clean:
+	rm -f $(ZIP_PATH)
