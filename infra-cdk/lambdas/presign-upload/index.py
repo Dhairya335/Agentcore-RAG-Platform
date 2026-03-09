@@ -68,7 +68,7 @@ def handler(event, context):
     except Exception:
         pass  # First upload ever — version stays 1
 
-    s3_key = f"raw-docs/{tenant_id}/{doc_id}/v{version}/{file_name}"
+    s3_key = f"{tenant_id}/v{version}/{file_name}"
     
     # Generate presigned S3 PUT URL browser uploads directly to S3 without going through Lambda — no bottleneck, no size limit. ExpiresIn=900 → URL expires in 15 minutes.
     try:
@@ -98,7 +98,6 @@ def handler(event, context):
                             "PK":          {"S": latest_pk},
                             "SK":          {"S": f"VER#{version:06d}"},
                             "tenantId":    {"S": tenant_id},
-                            "docId":       {"S": doc_id},
                             "version":     {"N": str(version)},
                             "status":      {"S": "UPLOADED"},
                             # Phase 2C ingestion worker changes this to READY
