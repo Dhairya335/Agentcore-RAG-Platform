@@ -149,11 +149,6 @@ export class AmplifyHostingStack extends cdk.NestedStack {
       architecture: lambda.Architecture.ARM_64,
 
       timeout: cdk.Duration.minutes(5),
-      logGroup: new logs.LogGroup(this, "FrontendDeployerLogGroup", {
-        logGroupName:   `/aws/lambda/${props.config.stack_name_base}-frontend-deployer`,
-        retention:      logs.RetentionDays.ONE_WEEK,
-        removalPolicy:  cdk.RemovalPolicy.DESTROY,
-      }),
     })
 
     this.stagingBucket.grantRead(deployerLambda)
