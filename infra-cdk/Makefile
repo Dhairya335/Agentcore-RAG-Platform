@@ -28,7 +28,6 @@ format:
 	ruff format
 
 # CI/CD version of lint that only checks but doesn't modify files
-# Used in CI pipelines to verify code quality without making changes
 lint-cicd:
 	@echo "Running code quality checks..."
 	@if ! ruff check; then \
@@ -49,12 +48,15 @@ ZIP_PATH = frontend-build.zip
 
 .PHONY: deploy build-frontend clean
 
-build-frontend:
-    cd ../frontend && npm run build
-    cd ../frontend/build && python3 -c "import shutil; shutil.make_archive('../../infra-cdk/frontend-build', 'zip', '.')"
-
 deploy: build-frontend
-    cdk deploy --profile $(PROFILE)   
+	cdk deploy --profile $(PROFILE)
+
+build-frontend:
+	@echo "Building frontend..."
+	cd $(FRONTEND_DIR) && npm run build
+	@echo "Zipping build output..."
+	cd $(FRONTEND_DIR)/build && python3 -c "import shutil; shutil.make_archive('../../infra-cdk/frontend-build', 'zip', '.')"
+	@echo "frontend-build.zip ready."
 
 clean:
 	rm -f $(ZIP_PATH)
