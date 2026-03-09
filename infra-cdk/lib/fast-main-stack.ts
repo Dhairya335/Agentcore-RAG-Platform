@@ -21,31 +21,10 @@ export class FastMainStack extends cdk.Stack {
       "Fullstack AgentCore Solution Template - Main Stack (v0.3.1) (uksb-v6dos0t5g8)"
     super(scope, id, { ...props, description })
 
+    // AmplifyHostingStack has no cross-stack dependencies — no circular refs.
+    // The deployer Lambda reads Cognito/API values from SSM at deploy time.
     this.amplifyHostingStack = new AmplifyHostingStack(this, `${id}-amplify`, {
       config: props.config,
-      // Cognito values — resolved by CFN token substitution at deploy time
-      cognitoAuthority:   `https://cognito-idp.${cdk.Aws.REGION}.amazonaws.com/${cdk.Lazy.string({
-        produce: () => this.cognitoStack.userPoolId
-      })}`,
-      cognitoClientId:    cdk.Lazy.string({
-        produce: () => this.cognitoStack.userPoolClientId
-      }),
-      // Lazy defers this until after this.amplifyHostingStack is assigned
-      cognitoRedirectUri: cdk.Lazy.string({
-        produce: () => this.amplifyHostingStack.amplifyUrl
-      }),
-      // Backend values — resolved after backend stack creates them
-      agentRuntimeArn:    cdk.Lazy.string({
-        produce: () => this.backendStack.runtimeArn
-      }),
-      awsRegion:          cdk.Aws.REGION,
-      feedbackApiUrl:     cdk.Lazy.string({
-        produce: () => this.backendStack.feedbackApiUrl
-      }),
-      docsApiUrl:         cdk.Lazy.string({
-        produce: () => this.backendStack.docsApiUrl
-      }),
-      agentPattern:       props.config.backend?.pattern || "strands-single-agent",
     })
 
     // Step 2: Cognito — needs Amplify URL for callback URLs

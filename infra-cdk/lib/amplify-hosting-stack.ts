@@ -11,15 +11,9 @@ import * as path from "path"
 
 export interface AmplifyStackProps extends cdk.NestedStackProps {
   config: AppConfig
-  // All the values needed to generate aws-exports.json at deploy time
-  cognitoAuthority: string
-  cognitoClientId: string
-  cognitoRedirectUri: string
-  agentRuntimeArn: string
-  awsRegion: string
-  feedbackApiUrl: string
-  docsApiUrl: string
-  agentPattern: string
+  // No cross-stack props here — eliminates circular dependency between
+  // amplify/cognito/backend stacks. The deployer Lambda reads all runtime
+  // values (Cognito IDs, API URLs etc.) from SSM at deploy time instead.
 }
 
 export class AmplifyHostingStack extends cdk.NestedStack {
@@ -104,30 +98,14 @@ export class AmplifyHostingStack extends cdk.NestedStack {
 
     this.amplifyUrl = `https://main.${this.amplifyApp.appId}.amplifyapp.com`
 
-    // Generate aws-exports.json content from CDK values
-    // This file is fetched by the React app at runtime (fetch("/aws-exports.json"))
-    const awsExportsContent = JSON.stringify({
-      authority:                    props.cognitoAuthority,
-      client_id:                    props.cognitoClientId,
-      redirect_uri:                 props.cognitoRedirectUri,
-      post_logout_redirect_uri:     props.cognitoRedirectUri,
-      response_type:                "code",
-      scope:                        "email openid profile",
-      automaticSilentRenew:         true,
-      agentRuntimeArn:              props.agentRuntimeArn,
-      awsRegion:                    props.awsRegion,
-      feedbackApiUrl:               props.feedbackApiUrl,
-      docsApiUrl:                   props.docsApiUrl,
-      agentPattern:                 props.agentPattern,
-    }, null, 2)
-
-    // Upload pre-built frontend zip + generated aws-exports.json to staging S3.
+    // Upload pre-built frontend zip to staging S3.
     //
     // The zip is built BEFORE cdk deploy via: make build-frontend
-    // (or: cd frontend && npm run build && cd build && python3 -c "import shutil; shutil.make_archive('../../../infra-cdk/frontend-build', 'zip', '.')")
     // This produces infra-cdk/frontend-build.zip which CDK uploads as a plain asset.
     //
-    // No bundling, no Docker — CDK just treats it as a static file upload.
+    // aws-exports.json is NOT generated here — it is assembled by the deployer
+    // Lambda at deploy time by reading values from SSM. This avoids circular
+    // dependencies between the amplify/cognito/backend nested stacks.
     const frontendZipPath = path.join(__dirname, "..", "frontend-build.zip")
 
     // Fail fast at synth time if zip is missing — tells you exactly what to run
@@ -141,10 +119,8 @@ export class AmplifyHostingStack extends cdk.NestedStack {
 
     const frontendDeployment = new s3deploy.BucketDeployment(this, "FrontendZipUpload", {
       sources: [
-        // Source 1: pre-built frontend zip — plain asset, no bundling
+        // Pre-built frontend zip — plain asset, no bundling, no Docker
         s3deploy.Source.asset(frontendZipPath),
-        // Source 2: generated aws-exports.json — always in sync with deployed infra
-        s3deploy.Source.jsonData("aws-exports.json", JSON.parse(awsExportsContent)),
       ],
       destinationBucket: this.stagingBucket,
       destinationKeyPrefix: "frontend/",
@@ -196,6 +172,16 @@ export class AmplifyHostingStack extends cdk.NestedStack {
       ],
     }))
 
+    // SSM read — Lambda reads Cognito/API values to build aws-exports.json
+    deployerLambda.addToRolePolicy(new iam.PolicyStatement({
+      effect:  iam.Effect.ALLOW,
+      actions: ["ssm:GetParameter", "ssm:GetParameters"],
+      resources: [
+        `arn:aws:ssm:${cdk.Stack.of(this).region}:${cdk.Stack.of(this).account}`
+          + `:parameter/${props.config.stack_name_base}/*`,
+      ],
+    }))
+
     // Custom Resource — triggers the deployer Lambda on every cdk deploy
     const deployerResource = new cdk.CustomResource(this, "FrontendDeployerResource", {
       serviceToken: deployerLambda.functionArn,
@@ -204,6 +190,8 @@ export class AmplifyHostingStack extends cdk.NestedStack {
         BranchName:     "main",
         StagingBucket:  this.stagingBucket.bucketName,
         ZipKey:         "frontend/frontend-build.zip",
+        StackName:      props.config.stack_name_base,
+        AmplifyUrl:     this.amplifyUrl,
         DeployVersion:  "2",
       },
     })
