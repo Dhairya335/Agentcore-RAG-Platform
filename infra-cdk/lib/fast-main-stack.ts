@@ -21,9 +21,6 @@ export class FastMainStack extends cdk.Stack {
       "Fullstack AgentCore Solution Template - Main Stack (v0.3.1) (uksb-v6dos0t5g8)"
     super(scope, id, { ...props, description })
 
-    // Step 1: Create Amplify stack first to get the predictable domain URL.
-    // Need the URL before Cognito so we can add it as a callback URL.
-    // NOTE: At this point AmplifyHostingStack gets a placeholder for values that come from Cognito/Backend — those are resolved by CFN at deploy time.
     this.amplifyHostingStack = new AmplifyHostingStack(this, `${id}-amplify`, {
       config: props.config,
       // Cognito values — resolved by CFN token substitution at deploy time
@@ -33,7 +30,10 @@ export class FastMainStack extends cdk.Stack {
       cognitoClientId:    cdk.Lazy.string({
         produce: () => this.cognitoStack.userPoolClientId
       }),
-      cognitoRedirectUri: `https://main.${this.amplifyHostingStack.amplifyApp.appId}.amplifyapp.com`,
+      // Lazy defers this until after this.amplifyHostingStack is assigned
+      cognitoRedirectUri: cdk.Lazy.string({
+        produce: () => this.amplifyHostingStack.amplifyUrl
+      }),
       // Backend values — resolved after backend stack creates them
       agentRuntimeArn:    cdk.Lazy.string({
         produce: () => this.backendStack.runtimeArn
@@ -62,8 +62,6 @@ export class FastMainStack extends cdk.Stack {
       userPoolDomain:   this.cognitoStack.userPoolDomain,
       frontendUrl:      this.amplifyHostingStack.amplifyUrl,
     })
-
-    // ── Outputs ────────────────────────────────────────────────────────────────
 
     new cdk.CfnOutput(this, "AmplifyAppId", {
       value:       this.amplifyHostingStack.amplifyApp.appId,
