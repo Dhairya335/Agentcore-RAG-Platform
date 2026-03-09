@@ -27,7 +27,7 @@ import {
   AlertCircle,
   Loader2,
 } from "lucide-react"
-import { uploadDocument, getContentType, UploadedDocument } from "@/services/documentService"
+import { uploadDocument, UploadedDocument } from "@/services/documentService"
 import { useAuth } from "react-oidc-context"
 
 // ─── Accepted file types ──────────────────────────────────────────────────────
