@@ -40,6 +40,15 @@ def get_ssm(name):
     return ssm_client.get_parameter(Name=name)["Parameter"]["Value"]
 
 
+def get_ssm_optional(name, default=""):
+    """Read an SSM parameter, returning default if it doesn't exist yet."""
+    try:
+        return ssm_client.get_parameter(Name=name)["Parameter"]["Value"]
+    except ssm_client.exceptions.ParameterNotFound:
+        print(f"WARNING: SSM parameter {name} not found, using default: '{default}'")
+        return default
+
+
 def build_aws_exports(stack_name, amplify_url, region):
     """Read all values from SSM and return aws-exports.json content as a string."""
     prefix = f"/{stack_name}"
@@ -54,7 +63,7 @@ def build_aws_exports(stack_name, amplify_url, region):
         "agentRuntimeArn":        get_ssm(f"{prefix}/runtime-arn"),
         "awsRegion":              region,
         "feedbackApiUrl":         get_ssm(f"{prefix}/feedback-api-url"),
-        "docsApiUrl":             get_ssm(f"{prefix}/rag/docs-api-url"),
+        "docsApiUrl":             get_ssm_optional(f"{prefix}/rag/docs-api-url"),
         "agentPattern":           "strands-single-agent",
     }, indent=2)
 
