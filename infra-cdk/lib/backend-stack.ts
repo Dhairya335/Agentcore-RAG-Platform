@@ -611,7 +611,7 @@ export class BackendStack extends cdk.NestedStack {
     const auroraSg = new ec2.SecurityGroup(this, "AuroraSg", {
       vpc:               ragVpc,
       securityGroupName: `${config.stack_name_base}-aurora-sg`,
-      description:       "Aurora pgvector — port 5432 from VPC CIDR only, no outbound",
+      description:       "Aurora pgvector port 5432 from VPC CIDR only, no outbound",
       allowAllOutbound:  false,
     })
 
