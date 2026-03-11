@@ -989,9 +989,8 @@ export class BackendStack extends cdk.NestedStack {
       timeout:      cdk.Duration.minutes(15),
       memorySize:   1024,  // PDF parsing + embedding is memory intensive
       environment: {
-        STACK_NAME:       config.stack_name_base,
-        DOCS_TABLE_NAME:  `${config.stack_name_base}-documents`,
-        AWS_DEFAULT_REGION: cdk.Aws.REGION,
+        STACK_NAME:      config.stack_name_base,
+        DOCS_TABLE_NAME: `${config.stack_name_base}-documents`,
       },
       logGroup: new logs.LogGroup(this, "IngestionWorkerLogGroup", {
         logGroupName:  `/aws/lambda/${config.stack_name_base}-ingestion-worker`,
