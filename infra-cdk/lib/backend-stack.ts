@@ -885,13 +885,15 @@ export class BackendStack extends cdk.NestedStack {
       modelName: "PresignRequest",
       schema: {
         type: apigateway.JsonSchemaType.OBJECT,
-        required: ["fileName", "contentType"],
+        required: ["fileName", "contentType", "tenantId"],
         properties: {
           fileName:    { type: apigateway.JsonSchemaType.STRING },
           contentType: { type: apigateway.JsonSchemaType.STRING },
+          tenantId:    { type: apigateway.JsonSchemaType.STRING },
           fileSize:    { type: apigateway.JsonSchemaType.NUMBER },
+          docId:       { type: apigateway.JsonSchemaType.STRING },
+          metadata:    { type: apigateway.JsonSchemaType.OBJECT },
         },
-        additionalProperties: false,
       },
     })
 
