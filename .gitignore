@@ -7,6 +7,9 @@ model.tar.gz
 .build_checksum
 .lib_checksum
 .vscode/
+.amazonq/
+.mkdocs/
+.github/
 .DS_Store
 dist/
 .sav/
