@@ -13,8 +13,12 @@ import { PythonFunction } from "@aws-cdk/aws-lambda-python-alpha"
 import * as lambda from "aws-cdk-lib/aws-lambda"
 import * as ecr_assets from "aws-cdk-lib/aws-ecr-assets"
 import * as cr from "aws-cdk-lib/custom-resources"
-import * as opensearchserverless from 'aws-cdk-lib/aws-opensearchserverless'
 import { Construct } from "constructs"
+import * as rds from "aws-cdk-lib/aws-rds"
+import * as ec2 from "aws-cdk-lib/aws-ec2"
+import * as sqs from "aws-cdk-lib/aws-sqs"
+import { SqsEventSource } from "aws-cdk-lib/aws-lambda-event-sources"
+import * as s3notify from "aws-cdk-lib/aws-s3-notifications"
 import { AppConfig } from "./utils/config-manager"
 import { AgentCoreRole } from "./utils/agentcore-role"
 import * as path from "path"
@@ -95,11 +99,14 @@ export class BackendStack extends cdk.NestedStack {
     // pattern)
     this.createFeedbackApi(props.config, props.frontendUrl, feedbackTable)
 
-    // Create Opensearch serveless Collections for Vector DB
+    // Create Aurora Serverless v2 Collection for Vector DB
     this.createVectorStore(props.config)
 
     // Phase 2B: Document upload infrastructure
     this.createDocumentUploadInfra(props.config, props.frontendUrl)
+
+    // Phase 2C: Ingestion pipeline
+    this.createIngestionPipeline(props.config)
 
   }
 
@@ -572,128 +579,150 @@ export class BackendStack extends cdk.NestedStack {
   }
 
   private createVectorStore(config: AppConfig): void {
-    const collectionName = `${config.stack_name_base}-rag-vectors`.toLowerCase()
-
-    // Encryption policy: OSS requires this BEFORE a collection can be created
-    const encryptionPolicy = new opensearchserverless.CfnSecurityPolicy(this, 'OSSEncryptionPolicy', {
-      name: `${config.stack_name_base}-rag-enc`.toLowerCase(),
-      type: 'encryption',
-      policy: JSON.stringify({
-        Rules: [{
-          ResourceType: 'collection',
-          Resource: [`collection/${collectionName}`]
-        }],
-        AWSOwnedKey: true,
-      }),
-    })
-
-    // Network policy: allows public HTTPS access to the collection endpoint
-    const networkPolicy = new opensearchserverless.CfnSecurityPolicy(this, 'OSSNetworkPolicy', {
-      name: `${config.stack_name_base}-rag-net`.toLowerCase(),
-      type: 'network',
-      policy: JSON.stringify([{
-        Rules: [
-          { ResourceType: 'collection', Resource: [`collection/${collectionName}`] },
-          { ResourceType: 'dashboard',  Resource: [`collection/${collectionName}`] },
-        ],
-        AllowFromPublic: true,
-      }]),
-    })
-
-    // Data access policy: what IAM principals can read/write actual documents
-    const dataAccessPolicy = new opensearchserverless.CfnAccessPolicy(this, 'OSSDataAccessPolicy', {
-      name: `${config.stack_name_base}-rag-access`.toLowerCase(),
-      type: 'data',
-      policy: JSON.stringify([{
-        Rules: [
-          {
-            ResourceType: 'index',
-            Resource: [`index/${collectionName}/*`],
-            Permission: [
-              'aoss:CreateIndex',
-              'aoss:DeleteIndex',
-              'aoss:UpdateIndex',
-              'aoss:DescribeIndex',
-              'aoss:ReadDocument',
-              'aoss:WriteDocument',
-            ],
-          },
-          {
-            ResourceType: 'collection',
-            Resource: [`collection/${collectionName}`],
-            Permission: [
-              'aoss:CreateCollectionItems',
-              'aoss:DescribeCollectionItems',
-            ],
-          },
-        ],
-        Principal: [`arn:aws:iam::${cdk.Stack.of(this).account}:root`],
-      }]),
-    })
-
-    const ossManagerLambda = new lambda.Function(this, 'OSSManagerLambda', {
-      functionName:  `${config.stack_name_base}-oss-manager`,
-      runtime:       lambda.Runtime.PYTHON_3_13,
-      code:          lambda.Code.fromAsset(
-        path.join(__dirname, '..', 'lambdas', 'oss-collection-manager')
-      ),
-      handler:       'index.handler',
-      architecture:  lambda.Architecture.ARM_64,
-      // WHY 15 minutes: OSS collections take 2-5 min to become ACTIVE.
-      // Lambda must stay alive during that wait.
-      timeout: cdk.Duration.minutes(15),
-      logGroup: new logs.LogGroup(this, 'OSSManagerLogGroup', {
-        logGroupName:    `/aws/lambda/${config.stack_name_base}-oss-manager`,
-        retention:       logs.RetentionDays.ONE_WEEK,
-        removalPolicy:   cdk.RemovalPolicy.DESTROY,
-      }),
-    })
-
-    ossManagerLambda.addToRolePolicy(new iam.PolicyStatement({
-      effect:    iam.Effect.ALLOW,
-      actions: [
-        'aoss:CreateCollection',
-        'aoss:DeleteCollection',
-        'aoss:ListCollections',
-        'aoss:BatchGetCollection',
+    // ── VPC ──────────────────────────────────────────────────────────────────
+    // WHY a dedicated VPC: Aurora requires subnets. We create a minimal VPC
+    // with PRIVATE_WITH_EGRESS subnets and natGateways:0 — this means Aurora
+    // has a proper route table (required for RDS Data API internal routing) but
+    // NO actual NAT gateway is deployed, so cost = $0.
+    //
+    // Lambda stays COMPLETELY OUTSIDE this VPC. It calls Aurora via the
+    // RDS Data API (HTTPS + IAM SigV4) — AWS routes this internally.
+    // No NAT Gateway, no VPC Endpoints, no extra cost.
+    const ragVpc = new ec2.Vpc(this, "RagVpc", {
+      vpcName:    `${config.stack_name_base}-rag-vpc`,
+      maxAzs:     2,
+      natGateways: 0,  // $0 — no NAT deployed. RDS Data API works without it.
+      subnetConfiguration: [
+        {
+          // PRIVATE_WITH_EGRESS = private subnet with route table.
+          // natGateways:0 means the route table has no NAT entry — effectively
+          // private. Aurora gets no public IP and no internet route. $0 cost.
+          name:       "rag-private",
+          subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS,
+          cidrMask:   24,
+        },
       ],
-      resources: ['*'],  // OSS collection ARNs are unknown before creation
-    }))
+    })
 
-    const ossCustomResource = new cdk.CustomResource(this, 'OSSCollectionResource', {
-      serviceToken: ossManagerLambda.functionArn,
-      // These are the properties your Lambda receives under event.ResourceProperties
-      properties: {
-        CollectionName: collectionName,
-        // Changing this triggers an Update event on the next deploy.
-        // Useful if you want to force a re-check. For now, keeping static.
-        Version: '1',
+    // ── SECURITY GROUP ────────────────────────────────────────────────────────
+    // Defence-in-depth layer 2 (layer 1 = no public IP).
+    // Inbound: only port 5432 from within the VPC CIDR.
+    // Outbound: explicitly denied — Aurora never initiates connections.
+    const auroraSg = new ec2.SecurityGroup(this, "AuroraSg", {
+      vpc:               ragVpc,
+      securityGroupName: `${config.stack_name_base}-aurora-sg`,
+      description:       "Aurora pgvector — port 5432 from VPC CIDR only, no outbound",
+      allowAllOutbound:  false,
+    })
+
+    auroraSg.addIngressRule(
+      ec2.Peer.ipv4(ragVpc.vpcCidrBlock),
+      ec2.Port.tcp(5432),
+      "PostgreSQL from VPC CIDR only"
+    )
+
+    // ── CREDENTIALS ──────────────────────────────────────────────────────────
+    // Secrets Manager keeps credentials out of env vars and code.
+    // RDS Data API reads this secret internally when executing statements.
+    const dbSecret = new secretsmanager.Secret(this, "AuroraSecret", {
+      secretName:  `${config.stack_name_base}/aurora-pgvector`,
+      description: "Aurora Serverless v2 pgvector master credentials",
+      generateSecretString: {
+        secretStringTemplate: JSON.stringify({ username: "pgadmin" }),
+        generateStringKey:    "password",
+        excludePunctuation:   true,
+        passwordLength:       32,
       },
     })
 
-    ossCustomResource.node.addDependency(encryptionPolicy)
-    ossCustomResource.node.addDependency(networkPolicy)
-    ossCustomResource.node.addDependency(dataAccessPolicy)
-
-    // Get the endpoint from the Lambda's response Data object
-    const collectionEndpoint = ossCustomResource.getAttString('CollectionEndpoint')
-
-    new ssm.StringParameter(this, 'OSSEndpointParam', {
-      parameterName: `/${config.stack_name_base}/rag/opensearch-endpoint`,
-      stringValue:   collectionEndpoint,
-      description:   'OpenSearch Serverless collection endpoint for RAG',
+    // ── AURORA SERVERLESS V2 CLUSTER ──────────────────────────────────────────
+    // minCapacity=0.5 → scales to near-zero when idle (~$0.06/hr floor).
+    // Aurora Serverless v2 true pause (minCapacity=0) is available in
+    // PostgreSQL 16.4+ with the pause feature flag — using 0.5 as safe default.
+    // enableDataApi=true → Lambda calls Aurora over HTTPS, never joins VPC.
+    // storageEncrypted=true → AES-256 at rest.
+    const dbCluster = new rds.DatabaseCluster(this, "AuroraCluster", {
+      clusterIdentifier:       `${config.stack_name_base}-pgvector`,
+      engine: rds.DatabaseClusterEngine.auroraPostgres({
+        version: rds.AuroraPostgresEngineVersion.VER_16_4,
+      }),
+      serverlessV2MinCapacity: 0.5,  // near-zero idle cost
+      serverlessV2MaxCapacity: 4,    // 4 ACUs = ~8 GB RAM peak
+      writer: rds.ClusterInstance.serverlessV2("writer"),
+      vpc:                     ragVpc,
+      vpcSubnets:              { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+      securityGroups:          [auroraSg],
+      defaultDatabaseName:     "ragdb",
+      credentials:             rds.Credentials.fromSecret(dbSecret),
+      enableDataApi:           true,   // HTTPS access — no VPC membership needed
+      storageEncrypted:        true,
+      removalPolicy:           cdk.RemovalPolicy.DESTROY,
     })
 
-    new ssm.StringParameter(this, 'OSSIndexNameParam', {
-      parameterName: `/${config.stack_name_base}/rag/opensearch-index-name`,
-      stringValue:   'fast-chunks-v1',
-      description:   'OpenSearch index name for document chunks',
+    // ── PGVECTOR SETUP LAMBDA (Custom Resource) ───────────────────────────────
+    // WHY Custom Resource: CloudFormation cannot execute SQL.
+    // This Lambda runs on every cdk deploy (Create + Update) via a Custom
+    // Resource — it creates the pgvector extension, fast_chunks table, and
+    // HNSW index idempotently (IF NOT EXISTS everywhere).
+    // Uses RDS Data API — no VPC, no TCP, just HTTPS + IAM.
+    const pgvectorSetupLambda = new lambda.Function(this, "PgvectorSetupLambda", {
+      functionName: `${config.stack_name_base}-pgvector-setup`,
+      runtime:      lambda.Runtime.PYTHON_3_13,
+      code:         lambda.Code.fromAsset(
+        path.join(__dirname, "..", "lambdas", "pgvector-setup")
+      ),
+      handler:      "index.handler",
+      architecture: lambda.Architecture.ARM_64,
+      timeout:      cdk.Duration.minutes(5),
+      environment: {
+        DB_CLUSTER_ARN: dbCluster.clusterArn,
+        DB_SECRET_ARN:  dbSecret.secretArn,
+        DB_NAME:        "ragdb",
+      },
+      logGroup: new logs.LogGroup(this, "PgvectorSetupLogGroup", {
+        logGroupName:  `/aws/lambda/${config.stack_name_base}-pgvector-setup`,
+        retention:     logs.RetentionDays.ONE_WEEK,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      }),
     })
 
-    new cdk.CfnOutput(this, 'OSSCollectionEndpoint', {
-      value:       collectionEndpoint,
-      description: 'OpenSearch Serverless collection endpoint',
-      exportName:  `${config.stack_name_base}-OSSCollectionEndpoint`,
+    // RDS Data API access + secret read
+    dbCluster.grantDataApiAccess(pgvectorSetupLambda)
+    dbSecret.grantRead(pgvectorSetupLambda)
+
+    const pgvectorSetupResource = new cdk.CustomResource(this, "PgvectorSetupResource", {
+      serviceToken: pgvectorSetupLambda.functionArn,
+      properties: {
+        // Bump SchemaVersion to force re-run on next deploy if schema changes
+        SchemaVersion: "1",
+      },
+    })
+
+    pgvectorSetupResource.node.addDependency(dbCluster)
+
+    // ── SSM PARAMETERS ────────────────────────────────────────────────────────
+    // Ingestion worker reads these at runtime — no hardcoded ARNs in code.
+    new ssm.StringParameter(this, "AuroraClusterArnParam", {
+      parameterName: `/${config.stack_name_base}/rag/aurora-cluster-arn`,
+      stringValue:   dbCluster.clusterArn,
+      description:   "Aurora Serverless v2 pgvector cluster ARN (RDS Data API)",
+    })
+
+    new ssm.StringParameter(this, "AuroraSecretArnParam", {
+      parameterName: `/${config.stack_name_base}/rag/aurora-secret-arn`,
+      stringValue:   dbSecret.secretArn,
+      description:   "Aurora pgvector Secrets Manager secret ARN",
+    })
+
+    new ssm.StringParameter(this, "AuroraDbNameParam", {
+      parameterName: `/${config.stack_name_base}/rag/aurora-db-name`,
+      stringValue:   "ragdb",
+      description:   "Aurora pgvector database name",
+    })
+
+    new cdk.CfnOutput(this, "AuroraClusterArn", {
+      value:       dbCluster.clusterArn,
+      description: "Aurora Serverless v2 pgvector cluster ARN",
     })
   }
 
@@ -849,6 +878,22 @@ export class BackendStack extends cdk.NestedStack {
       }
     )
 
+    // Request model: enforces schema at API Gateway edge before Lambda is invoked
+    const presignRequestModel = docsApi.addModel("PresignRequestModel", {
+      contentType: "application/json",
+      modelName: "PresignRequest",
+      schema: {
+        type: apigateway.JsonSchemaType.OBJECT,
+        required: ["fileName", "contentType"],
+        properties: {
+          fileName:    { type: apigateway.JsonSchemaType.STRING },
+          contentType: { type: apigateway.JsonSchemaType.STRING },
+          fileSize:    { type: apigateway.JsonSchemaType.NUMBER },
+        },
+        additionalProperties: false,
+      },
+    })
+
     // Route: POST /documents/presign
     // WHY /documents as parent resource: later we add
     //   POST /documents/ingest   (Phase 2C)
@@ -864,6 +909,7 @@ export class BackendStack extends cdk.NestedStack {
         authorizer: docsAuthorizer,
         authorizationType: apigateway.AuthorizationType.COGNITO,
         requestValidator: docsRequestValidator,
+        requestModels: { "application/json": presignRequestModel },
       }
     )
 
@@ -884,6 +930,140 @@ export class BackendStack extends cdk.NestedStack {
     new cdk.CfnOutput(this, "RawDocsBucketName", {
       value: rawDocsBucket.bucketName,
       description: "S3 bucket for raw uploaded documents",
+    })
+  }
+
+  private createIngestionPipeline(config: AppConfig): void {
+    // ── SQS QUEUE ─────────────────────────────────────────────────────────────
+    // WHY SQS between S3 and Lambda:
+    //   - S3 event notifications can only have ONE direct Lambda target.
+    //     SQS fan-out allows future subscribers without re-architecting.
+    //   - Built-in retry + DLQ — if ingestion crashes, message stays in queue
+    //     and retries up to maxReceiveCount times before going to DLQ.
+    //   - Decouples upload speed from ingestion speed — uploads never block.
+    const ingestionDlq = new sqs.Queue(this, "IngestionDlq", {
+      queueName:         `${config.stack_name_base}-ingestion-dlq`,
+      retentionPeriod:   cdk.Duration.days(14),  // keep failed messages 14 days
+      encryption:        sqs.QueueEncryption.SQS_MANAGED,
+    })
+
+    const ingestionQueue = new sqs.Queue(this, "IngestionQueue", {
+      queueName:             `${config.stack_name_base}-ingestion-queue`,
+      visibilityTimeout:     cdk.Duration.minutes(15),  // must match Lambda timeout
+      retentionPeriod:       cdk.Duration.days(4),
+      encryption:            sqs.QueueEncryption.SQS_MANAGED,
+      deadLetterQueue: {
+        queue:           ingestionDlq,
+        maxReceiveCount: 3,  // retry 3 times before DLQ
+      },
+    })
+
+    // ── S3 → SQS NOTIFICATION ─────────────────────────────────────────────────
+    // Lookup the raw-docs bucket created in createDocumentUploadInfra.
+    // We use fromBucketName instead of passing the bucket object to avoid
+    // making createIngestionPipeline depend on createDocumentUploadInfra
+    // return value — keeps methods independent.
+    const rawDocsBucket = s3.Bucket.fromBucketName(
+      this,
+      "RawDocsBucketRef",
+      `${config.stack_name_base}-raw-docs`.toLowerCase()
+    )
+
+    rawDocsBucket.addEventNotification(
+      s3.EventType.OBJECT_CREATED,
+      new s3notify.SqsDestination(ingestionQueue)
+    )
+
+    // ── INGESTION WORKER LAMBDA ───────────────────────────────────────────────
+    // Reads SSM at cold start to get Aurora ARNs — no hardcoded values.
+    // Triggered by SQS batchSize=1 so each document is processed independently.
+    // Timeout=15min matches queue visibilityTimeout — large PDFs can be slow.
+    const ingestionLambda = new lambda.Function(this, "IngestionWorkerLambda", {
+      functionName: `${config.stack_name_base}-ingestion-worker`,
+      runtime:      lambda.Runtime.PYTHON_3_13,
+      code:         lambda.Code.fromAsset(
+        path.join(__dirname, "..", "lambdas", "ingestion-worker")
+      ),
+      handler:      "index.handler",
+      architecture: lambda.Architecture.ARM_64,
+      timeout:      cdk.Duration.minutes(15),
+      memorySize:   1024,  // PDF parsing + embedding is memory intensive
+      environment: {
+        STACK_NAME:       config.stack_name_base,
+        DOCS_TABLE_NAME:  `${config.stack_name_base}-documents`,
+        AWS_DEFAULT_REGION: cdk.Aws.REGION,
+      },
+      logGroup: new logs.LogGroup(this, "IngestionWorkerLogGroup", {
+        logGroupName:  `/aws/lambda/${config.stack_name_base}-ingestion-worker`,
+        retention:     logs.RetentionDays.ONE_WEEK,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      }),
+    })
+
+    // ── IAM PERMISSIONS ───────────────────────────────────────────────────────
+
+    // S3: read the uploaded document
+    rawDocsBucket.grantRead(ingestionLambda)
+
+    // DynamoDB: update document status UPLOADED → READY / FAILED
+    ingestionLambda.addToRolePolicy(new iam.PolicyStatement({
+      effect:  iam.Effect.ALLOW,
+      actions: ["dynamodb:UpdateItem", "dynamodb:GetItem"],
+      resources: [
+        `arn:aws:dynamodb:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:table/${config.stack_name_base}-documents`,
+      ],
+    }))
+
+    // Bedrock: invoke Titan Embed V2 for embedding generation
+    ingestionLambda.addToRolePolicy(new iam.PolicyStatement({
+      effect:  iam.Effect.ALLOW,
+      actions: ["bedrock:InvokeModel"],
+      resources: [
+        `arn:aws:bedrock:${cdk.Aws.REGION}::foundation-model/amazon.titan-embed-text-v2:0`,
+      ],
+    }))
+
+    // RDS Data API: execute SQL against Aurora pgvector cluster
+    ingestionLambda.addToRolePolicy(new iam.PolicyStatement({
+      effect:  iam.Effect.ALLOW,
+      actions: [
+        "rds-data:ExecuteStatement",
+        "rds-data:BatchExecuteStatement",
+      ],
+      resources: ["*"],  // cluster ARN read from SSM at runtime
+    }))
+
+    // Secrets Manager: read Aurora credentials (required by RDS Data API)
+    ingestionLambda.addToRolePolicy(new iam.PolicyStatement({
+      effect:  iam.Effect.ALLOW,
+      actions: ["secretsmanager:GetSecretValue"],
+      resources: ["*"],  // secret ARN read from SSM at runtime
+    }))
+
+    // SSM: read Aurora ARNs + db name stored by createVectorStore
+    ingestionLambda.addToRolePolicy(new iam.PolicyStatement({
+      effect:  iam.Effect.ALLOW,
+      actions: ["ssm:GetParameter"],
+      resources: [
+        `arn:aws:ssm:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:parameter/${config.stack_name_base}/rag/*`,
+      ],
+    }))
+
+    // ── SQS EVENT SOURCE ──────────────────────────────────────────────────────
+    // batchSize=1: process one S3 object per Lambda invocation.
+    // This keeps error isolation clean — one bad file doesn't block others.
+    ingestionLambda.addEventSource(new SqsEventSource(ingestionQueue, {
+      batchSize:               1,
+      maxConcurrency:          5,   // max 5 parallel ingestion jobs
+      reportBatchItemFailures: true,
+    }))
+
+    // ── SQS GRANT ─────────────────────────────────────────────────────────────
+    ingestionQueue.grantConsumeMessages(ingestionLambda)
+
+    new cdk.CfnOutput(this, "IngestionQueueUrl", {
+      value:       ingestionQueue.queueUrl,
+      description: "SQS queue URL for document ingestion pipeline",
     })
   }
 

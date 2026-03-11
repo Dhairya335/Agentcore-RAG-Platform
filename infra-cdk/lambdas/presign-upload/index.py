@@ -70,7 +70,10 @@ def handler(event, context):
 
     s3_key = f"{tenant_id}/v{version}/{file_name}"
     
-    # Generate presigned S3 PUT URL browser uploads directly to S3 without going through Lambda — no bottleneck, no size limit. ExpiresIn=900 → URL expires in 15 minutes.
+    # Generate presigned S3 PUT URL. Browser uploads directly to S3 — no Lambda bottleneck.
+    # WHY Metadata here: the ingestion worker Lambda reads these from head_object() at ingest
+    # time. This avoids a DynamoDB lookup in the ingestion worker and keeps it stateless.
+    # S3 user-defined metadata keys are lowercased automatically by S3.
     try:
         upload_url = s3.generate_presigned_url(
             "put_object",
@@ -78,6 +81,11 @@ def handler(event, context):
                 "Bucket":      BUCKET_NAME,
                 "Key":         s3_key,
                 "ContentType": content_type,
+                "Metadata": {
+                    "doc-id":    doc_id,
+                    "tenant-id": tenant_id,
+                    "version":   str(version),
+                },
             },
             ExpiresIn=900,
         )
