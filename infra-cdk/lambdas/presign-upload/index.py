@@ -11,6 +11,8 @@ dynamodb_client = boto3.client("dynamodb")     # low-level: used for transact_wr
 BUCKET_NAME = os.environ["DOCS_BUCKET_NAME"]
 TABLE_NAME  = os.environ["DOCS_TABLE_NAME"]
 REGION      = os.environ.get("AWS_REGION", "us-east-1")
+CORS_ALLOWED_ORIGINS = os.environ.get("CORS_ALLOWED_ORIGINS", "*")
+cors_origins = [o.strip() for o in CORS_ALLOWED_ORIGINS.split(",") if o.strip()]
 
 
 def handler(event, context):
@@ -44,7 +46,7 @@ def handler(event, context):
     try:
         body = json.loads(event.get("body", "{}"))
     except Exception:
-        return _error(400, "Invalid JSON body")
+        return _error(400, "Invalid JSON body", event)
 
     file_name    = body.get("fileName")
     content_type = body.get("contentType", "text/plain")
@@ -52,7 +54,7 @@ def handler(event, context):
     metadata     = body.get("metadata", {})
 
     if not file_name or not tenant_id:
-        return _error(400, "fileName and tenantId are required")
+        return _error(400, "fileName and tenantId are required", event)
 
     doc_id = body.get("docId") or str(uuid.uuid4())
 
@@ -90,7 +92,7 @@ def handler(event, context):
             ExpiresIn=900,
         )
     except Exception as e:
-        return _error(500, f"Failed to generate presigned URL: {str(e)}")
+        return _error(500, f"Failed to generate presigned URL: {str(e)}", event)
 
     now = datetime.now(timezone.utc).isoformat()
 
@@ -145,15 +147,15 @@ def handler(event, context):
             ]
         )
     except dynamodb_client.exceptions.TransactionCanceledException as e:
-        return _error(409, f"Version conflict — document version already exists: {str(e)}")
+        return _error(409, f"Version conflict — document version already exists: {str(e)}", event)
     except Exception as e:
-        return _error(500, f"Failed to write DynamoDB records: {str(e)}")
+        return _error(500, f"Failed to write DynamoDB records: {str(e)}", event)
 
     return {
         "statusCode": 200,
         "headers": {
             "Content-Type": "application/json",
-            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Origin": _cors_origin(event),
         },
         "body": json.dumps({
             "uploadUrl": upload_url,
@@ -164,12 +166,17 @@ def handler(event, context):
     }
 
 
-def _error(status_code, message):
+def _cors_origin(event):
+    request_origin = (event.get("headers") or {}).get("origin", "")
+    return request_origin if request_origin in cors_origins else cors_origins[0]
+
+
+def _error(status_code, message, event={}):
     return {
         "statusCode": status_code,
         "headers": {
             "Content-Type": "application/json",
-            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Origin": _cors_origin(event),
         },
         "body": json.dumps({"error": message}),
     }

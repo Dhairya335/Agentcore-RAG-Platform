@@ -811,6 +811,7 @@ export class BackendStack extends cdk.NestedStack {
         DOCS_BUCKET_NAME: rawDocsBucket.bucketName,
         DOCS_TABLE_NAME:  docsTable.tableName,
         AWS_ACCOUNT_ID:   cdk.Aws.ACCOUNT_ID,
+        CORS_ALLOWED_ORIGINS: `${frontendUrl},http://localhost:3000`
       },
       logGroup: new logs.LogGroup(this, "PresignLambdaLogGroup", {
         logGroupName: `/aws/lambda/${config.stack_name_base}-presign-upload`,
