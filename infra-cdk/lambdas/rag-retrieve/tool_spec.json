@@ -1,28 +1,24 @@
-{
-  "tools": [
-    {
-      "name": "rag_retrieve_documents",
-      "description": "Search the user's uploaded documents for context relevant to their question. Use this tool FIRST whenever the user asks a question that could be answered by documents they have uploaded. Returns the most relevant text passages with source citations (file name and page number). If the tool returns an empty context_block, answer from general knowledge instead.",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "query": {
-            "type": "string",
-            "description": "The user's question or topic to search for in their uploaded documents. Use the full natural-language question for best retrieval quality."
-          },
-          "tenantId": {
-            "type": "string",
-            "description": "The user's unique tenant identifier (their Cognito sub claim). This scopes the search to only that user's documents."
-          },
-          "topK": {
-            "type": "integer",
-            "description": "Number of document chunks to retrieve (1-8). Defaults to 5. Use a higher value for broad or multi-part questions.",
-            "minimum": 1,
-            "maximum": 8
-          }
+[
+  {
+    "name": "rag_retrieve_documents",
+    "description": "Search the user's uploaded documents for context relevant to their question. Use this tool first whenever the user asks something that could be answered by their uploaded documents. Returns the most relevant text passages with source citations. If the result is empty, answer from general knowledge.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "The user's question to search for in their uploaded documents."
         },
-        "required": ["query", "tenantId"]
-      }
+        "tenantId": {
+          "type": "string",
+          "description": "The user's unique tenant ID (their Cognito sub claim). Scopes the search to their documents only."
+        },
+        "topK": {
+          "type": "integer",
+          "description": "Number of document chunks to retrieve (1-8, default 5)."
+        }
+      },
+      "required": ["query", "tenantId"]
     }
-  ]
-}
+  }
+]
