@@ -492,6 +492,38 @@ def _split_paragraphs(text: str) -> list[str]:
     return [p.strip() for p in re.split(r"\n\s*\n", text)]
 
 
+def _sanitise_text(text: str) -> str:
+    """
+    Scrub characters that Aurora / PostgreSQL UTF-8 rejects.
+
+    PostgreSQL TEXT columns forbid the null byte (U+0000, 0x00).  PyPDF2 and
+    other extractors can embed them as ligature artefacts or encoding glitches.
+    Python strings allow \x00 transparently, so the error only surfaces at the
+    SQL layer — hence the cryptic "invalid byte sequence for encoding UTF8: 0x00".
+
+    Steps (all O(N), single pass each):
+      1. Strip null bytes — the immediate cause of SQLState 22021.
+      2. Replace non-printable C0/C1 control characters (except \t \n \r)
+         with a space — they are meaningless in embedding text and can confuse
+         the tokeniser.
+      3. unicode NFC normalisation — collapses decomposed forms (e.g. e + combining
+         accent → é) so the tokeniser sees consistent token boundaries and Aurora
+         stores the canonical form.
+    """
+    import unicodedata
+
+    # 1. Remove null bytes
+    text = text.replace("\x00", "")
+
+    # 2. Remove other non-printable control characters (keep \t, \n, \r)
+    text = re.sub(r"[\x01-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]", " ", text)
+
+    # 3. NFC normalisation
+    text = unicodedata.normalize("NFC", text)
+
+    return text
+
+
 def _token_windows(
     ids: list[int],
     max_tokens: int,
@@ -605,7 +637,7 @@ def batch_insert_chunks(
             _str("source_type",   source_type),
             _int("chunk_index",   c.chunk_index),
             _int("chunk_total",   chunk_total),
-            _str("content",       c.content),
+            _str("content",       _sanitise_text(c.content)),
             _str("embedding",     vector_literal),
             _int("page_number",   c.page_number),
             _str("section_title", c.section_title),
