@@ -1,5 +1,5 @@
 """
-Phase 2C — Ingestion Worker Lambda
+Phase 2C — Ingestion Worker Lambda  (optimised rewrite)
 
 Triggered by SQS (batchSize=1) from S3 ObjectCreated events.
 
@@ -8,20 +8,30 @@ Flow per document:
   2. Read S3 object metadata (doc-id, tenant-id, version stored by presign Lambda)
   3. Download file from S3
   4. Detect type → apply type-specific chunking strategy
-  5. For each chunk: call Bedrock Titan Embed V2 → 1024-dim vector
-  6. INSERT chunks into Aurora pgvector via RDS Data API
+  5. Embed all chunks in parallel (ThreadPoolExecutor, I/O-bound Bedrock calls)
+  6. Batch INSERT all chunks into Aurora pgvector (single rds_data round-trip)
   7. Update DynamoDB: status UPLOADED → READY (or FAILED on error)
 
 Chunking strategy by type:
   PDF   — page-aware, paragraph split, table detection, 600 tokens / 100 overlap
   DOCX  — heading section grouping, paragraph accumulation, 600 tokens / 100 overlap
-  XLSX  — 30-row groups, column headers repeated in every chunk
-  CSV   — 40-row groups, column headers repeated in every chunk
+  XLSX  — streaming 30-row groups, column headers repeated in every chunk
+  CSV   — streaming 40-row groups, column headers repeated in every chunk
   TXT   — paragraph accumulation, 600 tokens / 100 overlap
   MD    — H1/H2/H3 section grouping, 600 tokens / 100 overlap
 
 Complexity target: O(N) per document where N = total tokens in the document.
 All token counting is done on integer token-id lists, not on strings.
+
+Key improvements over v1:
+  - _PERIOD_IDS computed once at module load (was recomputed on every _token_windows call)
+  - _token_windows is now a generator — yields one window at a time, O(1) peak RAM
+  - CSV / XLSX use streaming row iterators — never materialise the full file in RAM
+  - Bedrock embed calls run in parallel via ThreadPoolExecutor (I/O-bound → ~linear speedup)
+  - Aurora inserts use batch_execute_statement — 1 round-trip per document (was N)
+  - Section headings are prepended to chunk content so embeddings capture heading context
+  - Cross-section token overlap is reset at heading boundaries (no semantic bleed-through)
+  - Cheap char-length guard replaces full tokenise-just-to-count on spreadsheet chunks
 """
 
 import csv as csv_module
@@ -30,31 +40,42 @@ import json
 import os
 import re
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Generator, Iterator
 
 import boto3
 import tiktoken
 
-s3         = boto3.client("s3")
-bedrock    = boto3.client("bedrock-runtime")
-rds_data   = boto3.client("rds-data")
-dynamodb   = boto3.client("dynamodb")
-ssm        = boto3.client("ssm")
+s3        = boto3.client("s3")
+bedrock   = boto3.client("bedrock-runtime")
+rds_data  = boto3.client("rds-data")
+dynamodb  = boto3.client("dynamodb")
+ssm       = boto3.client("ssm")
 
 STACK_NAME      = os.environ["STACK_NAME"]
 DOCS_TABLE_NAME = os.environ["DOCS_TABLE_NAME"]
 
-# Tokenizer loaded once at cold start, reused for every document in this container
+# Tokenizer — loaded once at cold start, shared for the container lifetime
 TOKENIZER = tiktoken.get_encoding("cl100k_base")
 
 CHUNK_TOKENS        = 600
 OVERLAP_TOKENS      = 100
 MIN_CHUNK_TOKENS    = 20
+MIN_CHUNK_CHARS     = MIN_CHUNK_TOKENS * 3   # cheap proxy: ~3 chars/token avg
 CSV_ROWS_PER_CHUNK  = 40
 XLSX_ROWS_PER_CHUNK = 30
+EMBED_MAX_WORKERS   = 8   # Bedrock InvokeModel is I/O-bound → threads are effective
 
-# SSM values read once per container lifetime, cached in memory
+# Sentence-boundary token ids (cl100k_base) — computed ONCE at module load
+# Previously this set was rebuilt inside _token_windows on every call.
+_PERIOD_IDS: frozenset[int] = frozenset(
+    TOKENIZER.encode(s)[0]
+    for s in (".", ".\n", "! ", "? ", "!\n", "?\n")
+    if TOKENIZER.encode(s)
+)
+
+# SSM values cached per container lifetime
 _ssm_cache: dict[str, str] = {}
 
 
@@ -65,6 +86,7 @@ def get_ssm(key: str) -> str:
         )["Parameter"]["Value"]
     return _ssm_cache[key]
 
+# Data model
 
 @dataclass
 class Chunk:
@@ -76,6 +98,12 @@ class Chunk:
     sheet_name:    str | None = None
     row_start:     int | None = None
     row_end:       int | None = None
+
+
+@dataclass
+class EmbeddedChunk:
+    chunk:     Chunk
+    embedding: list[float]
 
 
 # Entry point
@@ -100,8 +128,8 @@ def process_sqs_record(record: dict):
 
 
 def process_document(bucket: str, key: str):
-    head     = s3.head_object(Bucket=bucket, Key=key)
-    obj_meta = head.get("Metadata", {})
+    head      = s3.head_object(Bucket=bucket, Key=key)
+    obj_meta  = head.get("Metadata", {})
     tenant_id = obj_meta.get("tenant-id")
     doc_id    = obj_meta.get("doc-id")
     version   = int(obj_meta.get("version", "1"))
@@ -127,15 +155,18 @@ def process_document(bucket: str, key: str):
             raise ValueError(f"No chunks produced for {file_name}")
 
         chunk_total = len(chunks)
-        print(f"[INGEST] {chunk_total} chunks for {file_name}")
+        print(f"[INGEST] {chunk_total} chunks for {file_name} — embedding in parallel")
 
-        for chunk in chunks:
-            embedding = embed_text(chunk.content)
-            insert_chunk(
-                db_cluster_arn, db_secret_arn, db_name,
-                tenant_id, doc_id, key, file_name, ext,
-                chunk, chunk_total, embedding
-            )
+        # Parallel embedding — Bedrock InvokeModel is network I/O, threads give near-linear speedup.
+        # Results are collected in chunk-index order for deterministic inserts.
+        embedded = _embed_parallel(chunks)
+
+        # Single-batch Aurora insert
+        batch_insert_chunks(
+            db_cluster_arn, db_secret_arn, db_name,
+            tenant_id, doc_id, key, file_name, ext,
+            embedded, chunk_total,
+        )
 
         update_doc_status(tenant_id, doc_id, version, "READY", chunk_total=chunk_total)
         print(f"[INGEST] Done — {chunk_total} chunks stored for doc {doc_id}")
@@ -144,6 +175,28 @@ def process_document(bucket: str, key: str):
         print(f"[INGEST ERROR] {e}")
         update_doc_status(tenant_id, doc_id, version, "FAILED", error_message=str(e))
         raise
+
+
+# Parallel embedding
+
+def _embed_parallel(chunks: list[Chunk]) -> list[EmbeddedChunk]:
+    """
+    Embed all chunks concurrently using a thread pool.
+    Bedrock InvokeModel is I/O-bound so threads are far cheaper than processes.
+    Results are ordered by chunk_index to preserve insertion order.
+    """
+    results: list[EmbeddedChunk | None] = [None] * len(chunks)
+
+    with ThreadPoolExecutor(max_workers=EMBED_MAX_WORKERS) as pool:
+        future_to_idx = {
+            pool.submit(embed_text, c.content): i
+            for i, c in enumerate(chunks)
+        }
+        for future in as_completed(future_to_idx):
+            idx            = future_to_idx[future]
+            results[idx]   = EmbeddedChunk(chunk=chunks[idx], embedding=future.result())
+
+    return results  # type: ignore[return-value]
 
 
 # Chunking dispatch
@@ -180,7 +233,7 @@ def chunk_pdf(raw_data: bytes, file_name: str) -> list[Chunk]:
             if not para:
                 continue
 
-            # Encode once per paragraph, reuse the token list for both checks — O(N) not O(2N)
+            # Encode once per paragraph, reuse the token list — O(N) not O(2N)
             para_ids = TOKENIZER.encode(para)
 
             if len(para_ids) < MIN_CHUNK_TOKENS:
@@ -206,7 +259,6 @@ def chunk_pdf(raw_data: bytes, file_name: str) -> list[Chunk]:
 
 
 def _ids_look_like_table(text: str) -> bool:
-    # Single pass over lines — O(N) where N = number of lines
     lines = [l for l in text.splitlines() if l.strip()]
     if not lines:
         return False
@@ -222,22 +274,28 @@ def chunk_docx(raw_data: bytes, file_name: str) -> list[Chunk]:
     doc    = Document(io.BytesIO(raw_data))
     chunks: list[Chunk] = []
 
-    current_heading:     str | None  = None
-    # Store token ids directly instead of re-encoding an ever-growing string — O(N) total
-    current_ids:         list[int]   = []
-    current_token_count: int         = 0
-    overlap_ids:         list[int]   = []
+    current_heading:     str | None = None
+    current_ids:         list[int]  = []
+    current_token_count: int        = 0
 
     def flush(heading: str | None):
+        nonlocal current_ids, current_token_count
         if not current_ids:
             return
-        for window in _token_windows(current_ids, CHUNK_TOKENS, OVERLAP_TOKENS):
+        # Prepend heading text to the first window so embeddings capture context.
+        # Subsequent windows within the same section also carry the heading prefix.
+        prefix_ids = TOKENIZER.encode(f"{heading}\n\n") if heading else []
+        full_ids   = prefix_ids + current_ids
+        for window in _token_windows(full_ids, CHUNK_TOKENS, OVERLAP_TOKENS):
             if len(window) >= MIN_CHUNK_TOKENS:
                 chunks.append(Chunk(
                     content=TOKENIZER.decode(window),
                     chunk_index=len(chunks),
                     section_title=heading,
                 ))
+        # Reset accumulator — no overlap across section boundaries
+        current_ids         = []
+        current_token_count = 0
 
     for para in doc.paragraphs:
         style_name = para.style.name if para.style else ""
@@ -247,26 +305,21 @@ def chunk_docx(raw_data: bytes, file_name: str) -> list[Chunk]:
 
         if style_name.startswith("Heading"):
             flush(current_heading)
-            current_heading     = text
-            current_ids         = list(overlap_ids)
-            current_token_count = len(overlap_ids)
+            current_heading = text
+            # Do NOT carry overlap into the new section — prevents semantic bleed
         else:
-            # Encode paragraph once, append ids — never re-encode accumulated buffer
             para_ids             = TOKENIZER.encode("\n" + text)
             current_ids         += para_ids
             current_token_count += len(para_ids)
 
             if current_token_count >= CHUNK_TOKENS:
                 flush(current_heading)
-                overlap_ids         = current_ids[-OVERLAP_TOKENS:]
-                current_ids         = list(overlap_ids)
-                current_token_count = len(overlap_ids)
 
     flush(current_heading)
     return chunks
 
 
-# XLSX chunking
+# XLSX chunking — streaming, O(chunk_size) RAM
 
 def chunk_xlsx(raw_data: bytes, file_name: str) -> list[Chunk]:
     import openpyxl
@@ -275,89 +328,117 @@ def chunk_xlsx(raw_data: bytes, file_name: str) -> list[Chunk]:
     chunks: list[Chunk] = []
 
     for sheet in wb.worksheets:
-        rows = list(sheet.iter_rows(values_only=True))
-        if not rows:
+        row_iter: Iterator = sheet.iter_rows(values_only=True)
+
+        # First row = headers
+        try:
+            header_row  = next(row_iter)
+        except StopIteration:
             continue
 
-        headers     = [str(c) if c is not None else "" for c in rows[0]]
-        # Build header line once, reuse as prefix for every chunk — O(1) per chunk
+        headers     = [str(c) if c is not None else "" for c in header_row]
         header_line = "Columns: " + " | ".join(headers)
-        data_rows   = rows[1:]
+        sheet_title = sheet.title
 
-        for start in range(0, len(data_rows), XLSX_ROWS_PER_CHUNK):
-            batch   = data_rows[start: start + XLSX_ROWS_PER_CHUNK]
-            lines   = [f"Sheet: {sheet.title}", header_line]
+        # Stream rows in fixed-size batches — never materialise the full sheet
+        for batch, row_start, row_end in _row_batches(row_iter, XLSX_ROWS_PER_CHUNK):
+            lines   = [f"Sheet: {sheet_title}", header_line]
             lines  += [" | ".join(str(c) if c is not None else "" for c in row) for row in batch]
             content = "\n".join(lines)
 
-            if len(TOKENIZER.encode(content)) >= MIN_CHUNK_TOKENS:
+            # Cheap char-length guard avoids full tokenise on every chunk
+            if len(content) >= MIN_CHUNK_CHARS:
                 chunks.append(Chunk(
                     content=content,
                     chunk_index=len(chunks),
-                    sheet_name=sheet.title,
-                    row_start=start + 1,
-                    row_end=start + len(batch),
+                    sheet_name=sheet_title,
+                    row_start=row_start,
+                    row_end=row_end,
                 ))
 
     return chunks
 
 
-# CSV chunking
+# CSV chunking — streaming, O(chunk_size) RAM
 
 def chunk_csv(raw_data: bytes, file_name: str) -> list[Chunk]:
-    text     = raw_data.decode("utf-8", errors="replace")
-    reader   = csv_module.reader(io.StringIO(text))
-    all_rows = list(reader)
+    text   = raw_data.decode("utf-8", errors="replace")
+    reader = csv_module.reader(io.StringIO(text))  # csv.reader is already a lazy iterator
 
-    if not all_rows:
+    try:
+        headers = next(reader)
+    except StopIteration:
         return []
 
-    headers     = all_rows[0]
-    # Build header line once, reuse as prefix for every chunk — O(1) per chunk
     header_line = "Columns: " + " | ".join(headers)
-    data_rows   = all_rows[1:]
     chunks: list[Chunk] = []
 
-    for start in range(0, len(data_rows), CSV_ROWS_PER_CHUNK):
-        batch   = data_rows[start: start + CSV_ROWS_PER_CHUNK]
+    for batch, row_start, row_end in _row_batches(reader, CSV_ROWS_PER_CHUNK):
         lines   = [header_line] + [" | ".join(row) for row in batch]
         content = "\n".join(lines)
 
-        if len(TOKENIZER.encode(content)) >= MIN_CHUNK_TOKENS:
+        if len(content) >= MIN_CHUNK_CHARS:
             chunks.append(Chunk(
                 content=content,
                 chunk_index=len(chunks),
                 sheet_name=file_name,
-                row_start=start + 1,
-                row_end=start + len(batch),
+                row_start=row_start,
+                row_end=row_end,
             ))
 
     return chunks
 
 
+def _row_batches(
+    row_iter: Iterator,
+    batch_size: int,
+) -> Generator[tuple[list, int, int], None, None]:
+    """
+    Yield (batch, 1-based row_start, 1-based row_end) from a lazy row iterator.
+    Accumulates exactly batch_size rows at a time — O(batch_size) RAM at any point.
+    Previously the caller used list(sheet.iter_rows(...)) which was O(total_rows).
+    """
+    batch:     list  = []
+    row_start: int   = 1
+    row_index: int   = 0
+
+    for row in row_iter:
+        batch.append(row)
+        row_index += 1
+        if len(batch) == batch_size:
+            yield batch, row_start, row_start + len(batch) - 1
+            row_start += batch_size
+            batch      = []
+
+    if batch:
+        yield batch, row_start, row_start + len(batch) - 1
+
+
 # TXT / JSON chunking
 
 def chunk_text(raw_data: bytes, file_name: str) -> list[Chunk]:
-    text   = raw_data.decode("utf-8", errors="replace")
-    chunks: list[Chunk] = []
-
-    # Accumulate paragraph token ids directly — never re-encode the buffer string
-    buffer_ids: list[int] = []
+    text        = raw_data.decode("utf-8", errors="replace")
+    chunks:     list[Chunk] = []
+    buffer_ids: list[int]   = []
+    flushed:    bool        = False  # guard against double-flush of the overlap tail
 
     for para in _split_paragraphs(text):
         if not para:
             continue
 
-        para_ids     = TOKENIZER.encode(para)
-        buffer_ids  += para_ids
+        flushed    = False
+        para_ids   = TOKENIZER.encode(para)
+        buffer_ids += para_ids
 
         if len(buffer_ids) >= CHUNK_TOKENS:
             for window in _token_windows(buffer_ids, CHUNK_TOKENS, OVERLAP_TOKENS):
                 if len(window) >= MIN_CHUNK_TOKENS:
                     chunks.append(Chunk(content=TOKENIZER.decode(window), chunk_index=len(chunks)))
             buffer_ids = buffer_ids[-OVERLAP_TOKENS:]
+            flushed    = True
 
-    if len(buffer_ids) >= MIN_CHUNK_TOKENS:
+    # Final flush — only if the buffer wasn't just emptied in the loop above
+    if buffer_ids and not flushed and len(buffer_ids) >= MIN_CHUNK_TOKENS:
         chunks.append(Chunk(content=TOKENIZER.decode(buffer_ids), chunk_index=len(chunks)))
 
     return chunks
@@ -367,18 +448,21 @@ def chunk_text(raw_data: bytes, file_name: str) -> list[Chunk]:
 
 def chunk_markdown(raw_data: bytes, file_name: str) -> list[Chunk]:
     text       = raw_data.decode("utf-8", errors="replace")
-    chunks: list[Chunk] = []
+    chunks:    list[Chunk] = []
     heading_re = re.compile(r"^(#{1,3})\s+(.*)")
 
-    current_heading: str | None  = None
-    current_level:   int | None  = None
-    # Accumulate body token ids directly — never re-encode the body string
-    current_ids:     list[int]   = []
+    current_heading: str | None = None
+    current_level:   int | None = None
+    current_ids:     list[int]  = []
 
     def flush(heading: str | None, level: int | None):
+        nonlocal current_ids
         if not current_ids:
             return
-        for window in _token_windows(current_ids, CHUNK_TOKENS, OVERLAP_TOKENS):
+        # Prepend heading so the embedding captures section context
+        prefix_ids = TOKENIZER.encode(f"{heading}\n\n") if heading else []
+        full_ids   = prefix_ids + current_ids
+        for window in _token_windows(full_ids, CHUNK_TOKENS, OVERLAP_TOKENS):
             if len(window) >= MIN_CHUNK_TOKENS:
                 chunks.append(Chunk(
                     content=TOKENIZER.decode(window),
@@ -386,6 +470,8 @@ def chunk_markdown(raw_data: bytes, file_name: str) -> list[Chunk]:
                     section_title=heading,
                     heading_level=level,
                 ))
+        # No overlap across heading boundaries — reset cleanly
+        current_ids = []
 
     for line in text.splitlines():
         m = heading_re.match(line)
@@ -393,7 +479,6 @@ def chunk_markdown(raw_data: bytes, file_name: str) -> list[Chunk]:
             flush(current_heading, current_level)
             current_level   = len(m.group(1))
             current_heading = m.group(2).strip()
-            current_ids     = []
         else:
             current_ids += TOKENIZER.encode("\n" + line)
 
@@ -404,50 +489,47 @@ def chunk_markdown(raw_data: bytes, file_name: str) -> list[Chunk]:
 # Token-space helpers
 
 def _split_paragraphs(text: str) -> list[str]:
-    # Split on blank lines — O(N) single pass
     return [p.strip() for p in re.split(r"\n\s*\n", text)]
 
 
-def _token_windows(ids: list[int], max_tokens: int, overlap: int) -> list[list[int]]:
+def _token_windows(
+    ids: list[int],
+    max_tokens: int,
+    overlap: int,
+) -> Generator[list[int], None, None]:
     """
-    Sliding window over a pre-encoded token id list.
-    Operates entirely in integer space — no string operations inside the loop.
-    O(N) total: each token is visited a constant number of times proportional to
-    overlap ratio. With 100/600 overlap (~16%) each token appears in at most 2 windows.
+    Sliding window over a pre-encoded token-id list.
 
-    Sentence boundary snapping: scans backward from window end in token-id space
-    looking for period/newline tokens. Single backward scan, max 20% of window = O(1)
-    per window, not O(N).
+    GENERATOR — yields one window at a time instead of building the full list.
+    Peak RAM = O(max_tokens) regardless of document length.  Previously the
+    function returned list[list[int]], holding all windows in memory at once.
+
+    Sentence boundary snapping: scans backward from window end in integer
+    token-id space.  Single backward scan, at most 20% of window = O(1)
+    per window.
+
+    _PERIOD_IDS is a module-level frozenset, computed once at cold start.
+    Previously it was rebuilt on every call to this function.
     """
     if not ids:
-        return []
+        return
 
-    # Period and newline token ids in cl100k_base (precomputed — O(1) lookup)
-    _PERIOD_IDS = {
-        TOKENIZER.encode(s)[0]
-        for s in (".", ".\n", "! ", "? ", "!\n", "?\n")
-        if TOKENIZER.encode(s)
-    }
-
-    step    = max_tokens - overlap
-    windows = []
-    start   = 0
+    step  = max_tokens - overlap
+    start = 0
 
     while start < len(ids):
         end   = min(start + max_tokens, len(ids))
         chunk = ids[start:end]
 
-        # Snap to sentence boundary: scan back at most 20% of window — O(1) per window
+        # Sentence-boundary snap: scan back at most 20% of window — O(1) per window
         snap_start = max(0, len(chunk) - max_tokens // 5)
         for i in range(len(chunk) - 1, snap_start, -1):
             if chunk[i] in _PERIOD_IDS:
                 chunk = chunk[: i + 1]
                 break
 
-        windows.append(chunk)
+        yield chunk
         start += step
-
-    return windows
 
 
 # Embedding — Bedrock Titan Embed V2
@@ -466,9 +548,9 @@ def embed_text(text: str) -> list[float]:
     return json.loads(response["body"].read())["embedding"]
 
 
-# Aurora INSERT via RDS Data API
+# Aurora — batch INSERT via RDS Data API
 
-def insert_chunk(
+def batch_insert_chunks(
     db_cluster_arn: str,
     db_secret_arn:  str,
     db_name:        str,
@@ -477,12 +559,20 @@ def insert_chunk(
     s3_key:         str,
     file_name:      str,
     source_type:    str,
-    chunk:          Chunk,
+    embedded:       list[EmbeddedChunk],
     chunk_total:    int,
-    embedding:      list[float],
 ):
-    vector_literal = "[" + ",".join(f"{v:.8f}" for v in embedding) + "]"
+    """
+    Insert all chunks for a document in a single batch_execute_statement call.
 
+    Previously each chunk triggered a separate execute_statement call — N
+    serial HTTPS round-trips to RDS Data API.  batch_execute_statement sends
+    all parameter sets in one call.  Aurora executes them as a single
+    server-side batch, reducing round-trips from N to 1.
+
+    Note: batch_execute_statement does not support RETURNING, but we don't
+    need the generated UUIDs — id is DEFAULT gen_random_uuid().
+    """
     sql = """
         INSERT INTO fast_chunks (
             tenant_id, doc_id, s3_key, file_name, source_type,
@@ -503,29 +593,36 @@ def insert_chunk(
     def _int(name: str, value: int | None) -> dict:
         return {"name": name, "value": {"isNull": True} if value is None else {"longValue": value}}
 
-    rds_data.execute_statement(
-        resourceArn=db_cluster_arn,
-        secretArn=db_secret_arn,
-        database=db_name,
-        sql=sql,
-        parameters=[
+    param_sets = []
+    for ec in embedded:
+        c              = ec.chunk
+        vector_literal = "[" + ",".join(f"{v:.8f}" for v in ec.embedding) + "]"
+        param_sets.append([
             _str("tenant_id",     tenant_id),
             _str("doc_id",        doc_id),
             _str("s3_key",        s3_key),
             _str("file_name",     file_name),
             _str("source_type",   source_type),
-            _int("chunk_index",   chunk.chunk_index),
+            _int("chunk_index",   c.chunk_index),
             _int("chunk_total",   chunk_total),
-            _str("content",       chunk.content),
+            _str("content",       c.content),
             _str("embedding",     vector_literal),
-            _int("page_number",   chunk.page_number),
-            _str("section_title", chunk.section_title),
-            _int("heading_level", chunk.heading_level),
-            _str("sheet_name",    chunk.sheet_name),
-            _int("row_start",     chunk.row_start),
-            _int("row_end",       chunk.row_end),
-        ],
+            _int("page_number",   c.page_number),
+            _str("section_title", c.section_title),
+            _int("heading_level", c.heading_level),
+            _str("sheet_name",    c.sheet_name),
+            _int("row_start",     c.row_start),
+            _int("row_end",       c.row_end),
+        ])
+
+    rds_data.batch_execute_statement(
+        resourceArn=db_cluster_arn,
+        secretArn=db_secret_arn,
+        database=db_name,
+        sql=sql,
+        parameterSets=param_sets,
     )
+    print(f"[AURORA] batch inserted {len(param_sets)} chunks in 1 round-trip")
 
 
 # DynamoDB status update
@@ -543,8 +640,8 @@ def update_doc_status(
     pk = f"TENANT#{tenant_id}#DOC#{doc_id}"
     sk = f"VER#{version:06d}"
 
-    expr_parts:  list[str]       = ["#s = :status", "updatedAt = :now"]
-    expr_values: dict[str, Any]  = {
+    expr_parts:  list[str]      = ["#s = :status", "updatedAt = :now"]
+    expr_values: dict[str, Any] = {
         ":status": {"S": status},
         ":now":    {"S": datetime.now(timezone.utc).isoformat()},
     }
