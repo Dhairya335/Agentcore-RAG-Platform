@@ -526,9 +526,7 @@ export class BackendStack extends cdk.NestedStack {
         throttlingRateLimit: 100,
         throttlingBurstLimit: 200,
         cachingEnabled: false,
-        // cacheClusterEnabled: true,
-        // cacheClusterSize: "0.5",
-        // cacheTtl: cdk.Duration.minutes(5),
+        cacheClusterEnabled: false,
         loggingLevel: apigateway.MethodLoggingLevel.INFO,
         dataTraceEnabled: true,
         metricsEnabled: true,
@@ -844,6 +842,7 @@ export class BackendStack extends cdk.NestedStack {
         stageName: "prod",
         loggingLevel: apigateway.MethodLoggingLevel.INFO,
         cachingEnabled: false,
+        cacheClusterEnabled: false,
         metricsEnabled: true,
         tracingEnabled: true,
         accessLogDestination: new apigateway.LogGroupLogDestination(
