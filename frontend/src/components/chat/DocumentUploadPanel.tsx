@@ -10,11 +10,13 @@
  *   - Drag & drop or click-to-browse file picker
  *   - Shows file name, size, and type icon
  *   - Live upload progress bar (0–100%)
+ *   - Post-upload ingestion status polling (Phase 2D):
+ *       Indexing… -> Ready to query  | Indexing failed
  *   - Success / error states with clear feedback
  *   - Supports: txt, pdf, docx, doc, csv, md, json, xlsx, pptx
  */
 
-import { useState, useRef, useCallback, DragEvent, ChangeEvent } from "react"
+import { useState, useRef, useCallback, useEffect, DragEvent, ChangeEvent } from "react"
 import { Button } from "@/components/ui/button"
 import { Progress } from "@/components/ui/progress"
 import {
@@ -27,26 +29,28 @@ import {
   AlertCircle,
   Loader2,
 } from "lucide-react"
-import { uploadDocument, UploadedDocument } from "@/services/documentService"
+import {
+  uploadDocument,
+  pollDocumentStatus,
+  UploadedDocument,
+  IndexingStatus,
+  DocumentStatus,
+} from "@/services/documentService"
 import { useAuth } from "react-oidc-context"
-
-// ─── Accepted file types ──────────────────────────────────────────────────────
 
 const ACCEPTED_EXTENSIONS = [
   ".txt", ".pdf", ".docx", ".doc",
   ".csv", ".md", ".json", ".xlsx", ".pptx",
 ]
-const ACCEPTED_MIME = ACCEPTED_EXTENSIONS.join(",")
-const MAX_FILE_SIZE_MB = 50
-
-// ─── Types ────────────────────────────────────────────────────────────────────
+const ACCEPTED_MIME      = ACCEPTED_EXTENSIONS.join(",")
+const MAX_FILE_SIZE_MB   = 50
 
 type UploadState =
   | { status: "idle" }
-  | { status: "selected"; file: File }
+  | { status: "selected";  file: File }
   | { status: "uploading"; file: File; progress: number }
-  | { status: "success"; file: File; doc: UploadedDocument }
-  | { status: "error"; file: File; message: string }
+  | { status: "success";   file: File; doc: UploadedDocument }
+  | { status: "error";     file: File; message: string }
 
 interface DocumentUploadPanelProps {
   /** Called when panel should be closed (e.g. user clicks X) */
@@ -55,31 +59,60 @@ interface DocumentUploadPanelProps {
   onUploadSuccess?: (doc: UploadedDocument) => void
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
 function formatFileSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  if (bytes < 1024)            return `${bytes} B`
+  if (bytes < 1024 * 1024)     return `${(bytes / 1024).toFixed(1)} KB`
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 }
 
 function FileIcon({ fileName }: { fileName: string }) {
   const ext = fileName.split(".").pop()?.toLowerCase() ?? ""
   if (["xlsx", "csv"].includes(ext)) return <FileSpreadsheet className="h-8 w-8 text-green-500" />
-  if (["pdf"].includes(ext)) return <FileText className="h-8 w-8 text-red-500" />
+  if (["pdf"].includes(ext))         return <FileText className="h-8 w-8 text-red-500" />
   if (["docx", "doc"].includes(ext)) return <FileText className="h-8 w-8 text-blue-500" />
   return <File className="h-8 w-8 text-gray-400" />
 }
 
-// ─── Component ────────────────────────────────────────────────────────────────
-
 export function DocumentUploadPanel({ onClose, onUploadSuccess }: DocumentUploadPanelProps) {
-  const [state, setState] = useState<UploadState>({ status: "idle" })
-  const [isDragOver, setIsDragOver] = useState(false)
-  const fileInputRef = useRef<HTMLInputElement>(null)
-  const auth = useAuth()
+  const [state, setState]             = useState<UploadState>({ status: "idle" })
+  const [isDragOver, setIsDragOver]   = useState(false)
 
-  // ── File validation ─────────────────────────────────────────────────────────
+  // Phase 2D — ingestion status tracked separately from S3 upload state
+  const [indexing, setIndexing]       = useState<IndexingStatus>("uploading")
+  const [indexMeta, setIndexMeta]     = useState<DocumentStatus | undefined>(undefined)
+
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  const auth         = useAuth()
+
+  //  Polling — start when upload succeeds, cancel on unmount 
+  //
+  // An AbortController is created once the document enters the "success" state.
+  // The controller's signal is passed to pollDocumentStatus so polling stops
+  // cleanly if the user closes the panel or the component unmounts.
+  useEffect(() => {
+    if (state.status !== "success") return
+
+    const idToken  = auth.user?.id_token
+    const tenantId = auth.user?.profile?.sub
+    if (!idToken || !tenantId) return
+
+    const controller = new AbortController()
+
+    pollDocumentStatus(
+      state.doc.docId,
+      tenantId,
+      idToken,
+      (status, meta) => {
+        setIndexing(status)
+        setIndexMeta(meta)
+      },
+      controller.signal,
+    )
+
+    // Cleanup: abort polling if component unmounts or state leaves "success"
+    return () => controller.abort()
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.status === "success" ? state.doc.docId : null])
 
   function validateFile(file: File): string | null {
     const ext = "." + (file.name.split(".").pop()?.toLowerCase() ?? "")
@@ -101,8 +134,6 @@ export function DocumentUploadPanel({ onClose, onUploadSuccess }: DocumentUpload
     setState({ status: "selected", file })
   }
 
-  // ── Drag and drop ───────────────────────────────────────────────────────────
-
   const handleDragOver = useCallback((e: DragEvent<HTMLDivElement>) => {
     e.preventDefault()
     setIsDragOver(true)
@@ -120,8 +151,6 @@ export function DocumentUploadPanel({ onClose, onUploadSuccess }: DocumentUpload
     if (file) selectFile(file)
   }, [])
 
-  // ── File input ──────────────────────────────────────────────────────────────
-
   const handleFileChange = (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     if (file) selectFile(file)
@@ -129,38 +158,29 @@ export function DocumentUploadPanel({ onClose, onUploadSuccess }: DocumentUpload
     e.target.value = ""
   }
 
-  // ── Upload ──────────────────────────────────────────────────────────────────
-
   async function handleUpload() {
     if (state.status !== "selected") return
 
     const { file } = state
 
-    // Get Cognito ID token — same as feedbackService pattern
-    const idToken = auth.user?.id_token
-    // Get userId from Cognito sub claim — used as tenantId (v1)
+    const idToken  = auth.user?.id_token
     const tenantId = auth.user?.profile?.sub
 
     if (!idToken || !tenantId) {
-      setState({
-        status: "error",
-        file,
-        message: "Authentication required. Please log in again.",
-      })
+      setState({ status: "error", file, message: "Authentication required. Please log in again." })
       return
     }
 
     setState({ status: "uploading", file, progress: 0 })
 
     try {
-      const doc = await uploadDocument(
-        file,
-        tenantId,
-        idToken,
-        (progress) => {
-          setState({ status: "uploading", file, progress })
-        }
-      )
+      const doc = await uploadDocument(file, tenantId, idToken, (progress) => {
+        setState({ status: "uploading", file, progress })
+      })
+
+      // Reset indexing state before entering success (in case of re-upload)
+      setIndexing("indexing")
+      setIndexMeta(undefined)
 
       setState({ status: "success", file, doc })
       onUploadSuccess?.(doc)
@@ -170,13 +190,11 @@ export function DocumentUploadPanel({ onClose, onUploadSuccess }: DocumentUpload
     }
   }
 
-  // ── Reset ───────────────────────────────────────────────────────────────────
-
   function handleReset() {
+    setIndexing("uploading")
+    setIndexMeta(undefined)
     setState({ status: "idle" })
   }
-
-  // ─── Render ─────────────────────────────────────────────────────────────────
 
   return (
     <div className="mx-4 mb-2 bg-white border border-gray-200 rounded-xl shadow-md overflow-hidden">
@@ -198,7 +216,7 @@ export function DocumentUploadPanel({ onClose, onUploadSuccess }: DocumentUpload
 
       <div className="p-4">
 
-        {/* ── IDLE: drag & drop zone ─────────────────────────────────────── */}
+        {/* IDLE: drag & drop zone  */}
         {state.status === "idle" && (
           <div
             onDragOver={handleDragOver}
@@ -231,7 +249,7 @@ export function DocumentUploadPanel({ onClose, onUploadSuccess }: DocumentUpload
           </div>
         )}
 
-        {/* ── SELECTED: file preview + upload button ─────────────────────── */}
+        {/*  SELECTED: file preview + upload button  */}
         {state.status === "selected" && (
           <div className="space-y-4">
             <div className="flex items-center gap-3 p-3 bg-gray-50 rounded-lg border border-gray-100">
@@ -260,7 +278,7 @@ export function DocumentUploadPanel({ onClose, onUploadSuccess }: DocumentUpload
           </div>
         )}
 
-        {/* ── UPLOADING: progress bar ────────────────────────────────────── */}
+        {/*  UPLOADING: progress bar  */}
         {state.status === "uploading" && (
           <div className="space-y-3">
             <div className="flex items-center gap-3 p-3 bg-gray-50 rounded-lg border border-gray-100">
@@ -272,7 +290,7 @@ export function DocumentUploadPanel({ onClose, onUploadSuccess }: DocumentUpload
             </div>
             <div className="space-y-1">
               <div className="flex justify-between text-xs text-gray-500">
-                <span>Uploading...</span>
+                <span>Uploading to S3…</span>
                 <span>{state.progress}%</span>
               </div>
               <Progress value={state.progress} className="h-2" />
@@ -280,21 +298,25 @@ export function DocumentUploadPanel({ onClose, onUploadSuccess }: DocumentUpload
           </div>
         )}
 
-        {/* ── SUCCESS ────────────────────────────────────────────────────── */}
+        {/* SUCCESS + INDEXING STATUS  */}
         {state.status === "success" && (
           <div className="space-y-4">
+
+            {/* File row — always green since S3 upload succeeded */}
             <div className="flex items-center gap-3 p-3 bg-green-50 rounded-lg border border-green-100">
               <CheckCircle2 className="h-8 w-8 text-green-500 flex-shrink-0" />
               <div className="flex-1 min-w-0">
                 <p className="text-sm font-medium text-gray-800 truncate">{state.file.name}</p>
-                <p className="text-xs text-green-600 font-medium">
-                  Uploaded successfully — processing will begin shortly
-                </p>
+                <p className="text-xs text-green-600 font-medium">Uploaded to S3 successfully</p>
                 <p className="text-xs text-gray-400 font-mono mt-0.5">
                   ID: {state.doc.docId.slice(0, 8)}… · v{state.doc.version}
                 </p>
               </div>
             </div>
+
+            {/* Indexing status banner — updates in real-time via polling */}
+            <IndexingStatusBanner status={indexing} meta={indexMeta} />
+
             <div className="flex gap-2 justify-end">
               <Button variant="outline" size="sm" onClick={handleReset}>
                 Upload another
@@ -306,7 +328,7 @@ export function DocumentUploadPanel({ onClose, onUploadSuccess }: DocumentUpload
           </div>
         )}
 
-        {/* ── ERROR ──────────────────────────────────────────────────────── */}
+        {/* ERROR  */}
         {state.status === "error" && (
           <div className="space-y-4">
             <div className="flex items-center gap-3 p-3 bg-red-50 rounded-lg border border-red-100">
@@ -327,4 +349,73 @@ export function DocumentUploadPanel({ onClose, onUploadSuccess }: DocumentUpload
       </div>
     </div>
   )
+}
+
+// IndexingStatusBanner
+//
+// Displays real-time ingestion progress below the upload success row.
+// Driven by pollDocumentStatus() in documentService.ts.
+
+interface IndexingStatusBannerProps {
+  status: IndexingStatus
+  meta?:  DocumentStatus
+}
+
+function IndexingStatusBanner({ status, meta }: IndexingStatusBannerProps) {
+  if (status === "uploading") {
+    // Transient — between S3 upload completing and first poll response
+    return null
+  }
+
+  if (status === "indexing") {
+    return (
+      <div className="flex items-center gap-2 px-3 py-2 bg-blue-50 rounded-lg border border-blue-100">
+        <Loader2 className="h-4 w-4 text-blue-500 animate-spin flex-shrink-0" />
+        <div>
+          <p className="text-xs font-medium text-blue-700">Indexing document…</p>
+          <p className="text-xs text-blue-500">
+            Chunks are being embedded and stored. This usually takes 5–30 seconds.
+          </p>
+        </div>
+      </div>
+    )
+  }
+
+  if (status === "ready") {
+    const chunkInfo = meta?.chunkCount != null
+      ? ` · ${meta.chunkCount} chunks indexed`
+      : ""
+    return (
+      <div className="flex items-center gap-2 px-3 py-2 bg-green-50 rounded-lg border border-green-100">
+        <CheckCircle2 className="h-4 w-4 text-green-600 flex-shrink-0" />
+        <div>
+          <p className="text-xs font-medium text-green-700">
+            Ready to query{chunkInfo}
+          </p>
+          <p className="text-xs text-green-600">
+            You can now ask questions about this document in the chat.
+          </p>
+        </div>
+      </div>
+    )
+  }
+
+  if (status === "failed") {
+    const errMsg = meta?.errorMessage
+      ? `: ${meta.errorMessage}`
+      : ". Please try uploading again."
+    return (
+      <div className="flex items-center gap-2 px-3 py-2 bg-red-50 rounded-lg border border-red-100">
+        <AlertCircle className="h-4 w-4 text-red-500 flex-shrink-0" />
+        <div>
+          <p className="text-xs font-medium text-red-700">Indexing failed{errMsg}</p>
+          <p className="text-xs text-red-500">
+            The file was uploaded to S3 but could not be processed. Try uploading again.
+          </p>
+        </div>
+      </div>
+    )
+  }
+
+  return null
 }

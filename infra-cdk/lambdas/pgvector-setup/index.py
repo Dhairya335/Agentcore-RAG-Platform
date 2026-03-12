@@ -28,10 +28,6 @@ DB_CLUSTER_ARN = os.environ["DB_CLUSTER_ARN"]
 DB_SECRET_ARN  = os.environ["DB_SECRET_ARN"]
 DB_NAME        = os.environ["DB_NAME"]
 
-
-# ── SQL statements ─────────────────────────────────────────────────────────────
-# All use IF NOT EXISTS — safe to re-run on every deploy without data loss.
-
 SCHEMA_STATEMENTS = [
 
     # 1. pgvector extension — must be first

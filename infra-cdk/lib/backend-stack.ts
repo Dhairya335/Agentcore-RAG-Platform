@@ -45,6 +45,8 @@ export class BackendStack extends cdk.NestedStack {
   private userPool: cognito.IUserPool
   private machineClient: cognito.UserPoolClient
   private agentRuntime: agentcore.Runtime
+  private gateway: bedrockagentcore.CfnGateway
+  private gatewayRole: iam.Role
 
   constructor(scope: Construct, id: string, props: BackendStackProps) {
     super(scope, id, props)
@@ -107,6 +109,9 @@ export class BackendStack extends cdk.NestedStack {
 
     // Phase 2C: Ingestion pipeline
     this.createIngestionPipeline(props.config)
+
+    // Phase 2D: RAG retrieval — registers rag-retrieve Lambda as a Gateway tool target
+    this.createRagRetrieve(props.config)
 
   }
 
@@ -577,7 +582,7 @@ export class BackendStack extends cdk.NestedStack {
   }
 
   private createVectorStore(config: AppConfig): void {
-    // ── VPC ──────────────────────────────────────────────────────────────────
+    // VPC                      
     // WHY a dedicated VPC: Aurora requires subnets. We create a minimal VPC
     // with PRIVATE_WITH_EGRESS subnets and natGateways:0 — this means Aurora
     // has a proper route table (required for RDS Data API internal routing) but
@@ -602,7 +607,7 @@ export class BackendStack extends cdk.NestedStack {
       ],
     })
 
-    // ── SECURITY GROUP ────────────────────────────────────────────────────────
+    //    SECURITY GROUP            
     // Defence-in-depth layer 2 (layer 1 = no public IP).
     // Inbound: only port 5432 from within the VPC CIDR.
     // Outbound: explicitly denied — Aurora never initiates connections.
@@ -619,7 +624,7 @@ export class BackendStack extends cdk.NestedStack {
       "PostgreSQL from VPC CIDR only"
     )
 
-    // ── CREDENTIALS ──────────────────────────────────────────────────────────
+    //    CREDENTIALS              
     // Secrets Manager keeps credentials out of env vars and code.
     // RDS Data API reads this secret internally when executing statements.
     const dbSecret = new secretsmanager.Secret(this, "AuroraSecret", {
@@ -633,7 +638,7 @@ export class BackendStack extends cdk.NestedStack {
       },
     })
 
-    // ── AURORA SERVERLESS V2 CLUSTER ──────────────────────────────────────────
+    //    AURORA SERVERLESS V2 CLUSTER                                           
     // minCapacity=0.5 → scales to near-zero when idle (~$0.06/hr floor).
     // Aurora Serverless v2 true pause (minCapacity=0) is available in
     // PostgreSQL 16.4+ with the pause feature flag — using 0.5 as safe default.
@@ -657,7 +662,7 @@ export class BackendStack extends cdk.NestedStack {
       removalPolicy:           cdk.RemovalPolicy.DESTROY,
     })
 
-    // ── PGVECTOR SETUP LAMBDA (Custom Resource) ───────────────────────────────
+    //    PGVECTOR SETUP LAMBDA (Custom Resource)                               ─
     // WHY Custom Resource: CloudFormation cannot execute SQL.
     // This Lambda runs on every cdk deploy (Create + Update) via a Custom
     // Resource — it creates the pgvector extension, fast_chunks table, and
@@ -698,7 +703,7 @@ export class BackendStack extends cdk.NestedStack {
 
     pgvectorSetupResource.node.addDependency(dbCluster)
 
-    // ── SSM PARAMETERS ────────────────────────────────────────────────────────
+    //    SSM PARAMETERS            
     // Ingestion worker reads these at runtime — no hardcoded ARNs in code.
     new ssm.StringParameter(this, "AuroraClusterArnParam", {
       parameterName: `/${config.stack_name_base}/rag/aurora-cluster-arn`,
@@ -915,8 +920,56 @@ export class BackendStack extends cdk.NestedStack {
       }
     )
 
+    //    Phase 2D: GET /documents/{docId}/status                               
+    // Returns the ingestion status of a document so the frontend can display
+    // "⏳ Indexing…" → "✅ Ready" or "❌ Failed" after upload.
+    //
+    // Uses a plain lambda.Function (no pip deps — only boto3 which is built-in).
+    // Reads the VER#000001 record from DynamoDB written by ingestion-worker.
+    const docStatusLambda = new lambda.Function(this, "DocStatusLambda", {
+      functionName: `${config.stack_name_base}-doc-status`,
+      runtime:      lambda.Runtime.PYTHON_3_13,
+      code:         lambda.Code.fromAsset(
+        path.join(__dirname, "..", "lambdas", "doc-status")
+      ),
+      handler:      "index.handler",
+      architecture: lambda.Architecture.ARM_64,
+      timeout:      cdk.Duration.seconds(10),
+      memorySize:   256,
+      environment: {
+        DOCS_TABLE_NAME:      docsTable.tableName,
+        CORS_ALLOWED_ORIGINS: `${frontendUrl},http://localhost:3000`,
+      },
+      logGroup: new logs.LogGroup(this, "DocStatusLogGroup", {
+        logGroupName:  `/aws/lambda/${config.stack_name_base}-doc-status`,
+        retention:     logs.RetentionDays.ONE_WEEK,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      }),
+    })
+
+    // Grant read access to the documents table
+    docsTable.grantReadData(docStatusLambda)
+
+    // Route: GET /documents/{docId}/status
+    // {docId} is a path parameter; tenantId is passed as a query string.
+    const docItemResource   = documentsResource.addResource("{docId}")
+    const statusResource    = docItemResource.addResource("status")
+
+    statusResource.addMethod(
+      "GET",
+      new apigateway.LambdaIntegration(docStatusLambda),
+      {
+        authorizer:        docsAuthorizer,
+        authorizationType: apigateway.AuthorizationType.COGNITO,
+        // Require tenantId query parameter so Lambda always has it
+        requestParameters: {
+          "method.request.querystring.tenantId": true,
+        },
+      }
+    )
+
     // SSM: store docs API URL for frontend
-    this.docsApiUrl = docsApi.url   // ← ADD THIS LINE
+    this.docsApiUrl = docsApi.url
     new ssm.StringParameter(this, "DocsApiUrlParam", {
       parameterName: `/${config.stack_name_base}/rag/docs-api-url`,
       stringValue: docsApi.url,
@@ -936,7 +989,7 @@ export class BackendStack extends cdk.NestedStack {
   }
 
   private createIngestionPipeline(config: AppConfig): void {
-    // ── SQS QUEUE ─────────────────────────────────────────────────────────────
+    //    SQS QUEUE                ─
     // WHY SQS between S3 and Lambda:
     //   - S3 event notifications can only have ONE direct Lambda target.
     //     SQS fan-out allows future subscribers without re-architecting.
@@ -960,7 +1013,7 @@ export class BackendStack extends cdk.NestedStack {
       },
     })
 
-    // ── S3 → SQS NOTIFICATION ─────────────────────────────────────────────────
+    //    S3 → SQS NOTIFICATION    ─
     // Lookup the raw-docs bucket created in createDocumentUploadInfra.
     // We use fromBucketName instead of passing the bucket object to avoid
     // making createIngestionPipeline depend on createDocumentUploadInfra
@@ -976,7 +1029,7 @@ export class BackendStack extends cdk.NestedStack {
       new s3notify.SqsDestination(ingestionQueue)
     )
 
-    // ── INGESTION WORKER LAMBDA ───────────────────────────────────────────────
+    //    INGESTION WORKER LAMBDA  ─
     // Reads SSM at cold start to get Aurora ARNs — no hardcoded values.
     // Triggered by SQS batchSize=1 so each document is processed independently.
     // Timeout=15min matches queue visibilityTimeout — large PDFs can be slow.
@@ -1005,7 +1058,7 @@ export class BackendStack extends cdk.NestedStack {
       }),
     })
 
-    // ── IAM PERMISSIONS ───────────────────────────────────────────────────────
+    //    IAM PERMISSIONS          ─
 
     // S3: read the uploaded document
     rawDocsBucket.grantRead(ingestionLambda)
@@ -1054,7 +1107,7 @@ export class BackendStack extends cdk.NestedStack {
       ],
     }))
 
-    // ── SQS EVENT SOURCE ──────────────────────────────────────────────────────
+    //    SQS EVENT SOURCE          
     // batchSize=1: process one S3 object per Lambda invocation.
     // This keeps error isolation clean — one bad file doesn't block others.
     ingestionLambda.addEventSource(new SqsEventSource(ingestionQueue, {
@@ -1063,7 +1116,7 @@ export class BackendStack extends cdk.NestedStack {
       reportBatchItemFailures: true,
     }))
 
-    // ── SQS GRANT ─────────────────────────────────────────────────────────────
+    //    SQS GRANT                ─
     ingestionQueue.grantConsumeMessages(ingestionLambda)
 
     new cdk.CfnOutput(this, "IngestionQueueUrl", {
@@ -1087,16 +1140,17 @@ export class BackendStack extends cdk.NestedStack {
     })
 
     // Create comprehensive IAM role for gateway
-    const gatewayRole = new iam.Role(this, "GatewayRole", {
+    // Stored as a class property so createRagRetrieve() can call grantInvoke on it.
+    this.gatewayRole = new iam.Role(this, "GatewayRole", {
       assumedBy: new iam.ServicePrincipal("bedrock-agentcore.amazonaws.com"),
       description: "Role for AgentCore Gateway with comprehensive permissions",
     })
 
     // Lambda invoke permission
-    toolLambda.grantInvoke(gatewayRole)
+    toolLambda.grantInvoke(this.gatewayRole)
 
     // Bedrock permissions (region-agnostic)
-    gatewayRole.addToPolicy(
+    this.gatewayRole.addToPolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
         actions: ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
@@ -1108,7 +1162,7 @@ export class BackendStack extends cdk.NestedStack {
     )
 
     // SSM parameter access
-    gatewayRole.addToPolicy(
+    this.gatewayRole.addToPolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
         actions: ["ssm:GetParameter", "ssm:GetParameters"],
@@ -1119,7 +1173,7 @@ export class BackendStack extends cdk.NestedStack {
     )
 
     // Cognito permissions
-    gatewayRole.addToPolicy(
+    this.gatewayRole.addToPolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
         actions: ["cognito-idp:DescribeUserPoolClient", "cognito-idp:InitiateAuth"],
@@ -1128,7 +1182,7 @@ export class BackendStack extends cdk.NestedStack {
     )
 
     // CloudWatch Logs
-    gatewayRole.addToPolicy(
+    this.gatewayRole.addToPolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
         actions: ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
@@ -1147,10 +1201,11 @@ export class BackendStack extends cdk.NestedStack {
     const cognitoDiscoveryUrl = `${cognitoIssuer}/.well-known/openid-configuration`
 
     // Create Gateway using L1 construct (CfnGateway)
-    // This replaces the Custom Resource approach with native CloudFormation support
-    const gateway = new bedrockagentcore.CfnGateway(this, "AgentCoreGateway", {
+    // Stored as a class property so createRagRetrieve() can reference
+    // gateway.attrGatewayIdentifier when registering additional tool targets.
+    this.gateway = new bedrockagentcore.CfnGateway(this, "AgentCoreGateway", {
       name: `${config.stack_name_base}-gateway`,
-      roleArn: gatewayRole.roleArn,
+      roleArn: this.gatewayRole.roleArn,
       protocolType: "MCP",
       protocolConfiguration: {
         mcp: {
@@ -1171,7 +1226,7 @@ export class BackendStack extends cdk.NestedStack {
 
     // Create Gateway Target using L1 construct (CfnGatewayTarget)
     const gatewayTarget = new bedrockagentcore.CfnGatewayTarget(this, "GatewayTarget", {
-      gatewayIdentifier: gateway.attrGatewayIdentifier,
+      gatewayIdentifier: this.gateway.attrGatewayIdentifier,
       name: "sample-tool-target",
       description: "Sample tool Lambda target",
       targetConfiguration: {
@@ -1192,31 +1247,31 @@ export class BackendStack extends cdk.NestedStack {
     })
 
     // Ensure proper creation order
-    gatewayTarget.addDependency(gateway)
-    gateway.node.addDependency(toolLambda)
-    gateway.node.addDependency(this.machineClient)
-    gateway.node.addDependency(gatewayRole)
+    gatewayTarget.addDependency(this.gateway)
+    this.gateway.node.addDependency(toolLambda)
+    this.gateway.node.addDependency(this.machineClient)
+    this.gateway.node.addDependency(this.gatewayRole)
 
     // Store Gateway URL in SSM for runtime access
     new ssm.StringParameter(this, "GatewayUrlParam", {
       parameterName: `/${config.stack_name_base}/gateway_url`,
-      stringValue: gateway.attrGatewayUrl,
+      stringValue: this.gateway.attrGatewayUrl,
       description: "AgentCore Gateway URL",
     })
 
     // Output gateway information
     new cdk.CfnOutput(this, "GatewayId", {
-      value: gateway.attrGatewayIdentifier,
+      value: this.gateway.attrGatewayIdentifier,
       description: "AgentCore Gateway ID",
     })
 
     new cdk.CfnOutput(this, "GatewayUrl", {
-      value: gateway.attrGatewayUrl,
+      value: this.gateway.attrGatewayUrl,
       description: "AgentCore Gateway URL",
     })
 
     new cdk.CfnOutput(this, "GatewayArn", {
-      value: gateway.attrGatewayArn,
+      value: this.gateway.attrGatewayArn,
       description: "AgentCore Gateway ARN",
     })
 
@@ -1334,5 +1389,132 @@ export class BackendStack extends cdk.NestedStack {
   private hashContent(content: string): string {
     const crypto = require("crypto")
     return crypto.createHash("sha256").update(content).digest("hex").slice(0, 16)
+  }
+
+  //    Phase 2D: RAG Retrieval  
+  //
+  // Creates the rag-retrieve Lambda and registers it as a second Gateway tool
+  // target alongside the existing sample-tool-target.
+  //
+  // Why a separate method (not inside createIngestionPipeline):
+  //   - Retrieval (read path) is architecturally distinct from ingestion (write path)
+  //   - Keeps each method single-responsibility
+  //   - Allows independent iteration on retrieval without touching ingestion
+  //
+  // Dependencies resolved before this method is called (constructor order):
+  //   - this.gateway      → set by createAgentCoreGateway()
+  //   - this.gatewayRole  → set by createAgentCoreGateway()
+  //   - Aurora SSM params → written by createVectorStore()
+  private createRagRetrieve(config: AppConfig): void {
+    //    Lambda                  ─
+    // Plain lambda.Function (not PythonFunction) — no pip dependencies.
+    // Only uses boto3 which is pre-installed in the Python 3.13 Lambda runtime.
+    // 512 MB memory: embedding + pgvector search is CPU-light, mostly network I/O.
+    // 30s timeout: embedding (~150ms) + pgvector search (~80ms) + overhead << 30s.
+    const ragRetrieveLambda = new lambda.Function(this, "RagRetrieveLambda", {
+      functionName: `${config.stack_name_base}-rag-retrieve`,
+      runtime:      lambda.Runtime.PYTHON_3_13,
+      code:         lambda.Code.fromAsset(
+        path.join(__dirname, "..", "lambdas", "rag-retrieve")
+      ),
+      handler:      "index.handler",
+      architecture: lambda.Architecture.ARM_64,
+      timeout:      cdk.Duration.seconds(30),
+      memorySize:   512,
+      environment: {
+        STACK_NAME: config.stack_name_base,
+      },
+      logGroup: new logs.LogGroup(this, "RagRetrieveLogGroup", {
+        logGroupName:  `/aws/lambda/${config.stack_name_base}-rag-retrieve`,
+        retention:     logs.RetentionDays.ONE_WEEK,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      }),
+    })
+
+    //    IAM: Bedrock — embed query with Titan V2                           
+    // Scoped to the exact model used at ingest time.
+    ragRetrieveLambda.addToRolePolicy(new iam.PolicyStatement({
+      effect:  iam.Effect.ALLOW,
+      actions: ["bedrock:InvokeModel"],
+      resources: [
+        `arn:aws:bedrock:${cdk.Aws.REGION}::foundation-model/amazon.titan-embed-text-v2:0`,
+      ],
+    }))
+
+    //    IAM: RDS Data API — execute similarity search                     ─
+    // Cluster ARN is read from SSM at Lambda runtime; resource must be "*"
+    // because the ARN is not known at CDK synth time (it's a token).
+    ragRetrieveLambda.addToRolePolicy(new iam.PolicyStatement({
+      effect:  iam.Effect.ALLOW,
+      actions: ["rds-data:ExecuteStatement"],
+      resources: ["*"],
+    }))
+
+    //    IAM: Secrets Manager — Aurora credentials (required by RDS Data API)   
+    ragRetrieveLambda.addToRolePolicy(new iam.PolicyStatement({
+      effect:  iam.Effect.ALLOW,
+      actions: ["secretsmanager:GetSecretValue"],
+      resources: ["*"],
+    }))
+
+    //    IAM: SSM — read Aurora ARNs + db name written by createVectorStore   
+    ragRetrieveLambda.addToRolePolicy(new iam.PolicyStatement({
+      effect:  iam.Effect.ALLOW,
+      actions: ["ssm:GetParameter"],
+      resources: [
+        `arn:aws:ssm:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:parameter/${config.stack_name_base}/rag/*`,
+      ],
+    }))
+
+    //    Gateway: grant the Gateway IAM role permission to invoke this Lambda   
+    // The Gateway executes tool calls by assuming its IAM role and invoking
+    // the registered Lambda targets. grantInvoke adds lambda:InvokeFunction
+    // to this.gatewayRole so it can call rag-retrieve in addition to sample-tool.
+    ragRetrieveLambda.grantInvoke(this.gatewayRole)
+
+    //    Gateway target: register rag-retrieve as a second MCP tool         
+    // Load the tool spec (OpenAPI-style JSON describing inputs + description
+    // shown to the Strands agent so it knows when/how to call this tool).
+    const ragToolSpecPath = path.join(
+      __dirname, "..", "lambdas", "rag-retrieve", "tool_spec.json"
+    )
+    const ragToolSpec = JSON.parse(fs.readFileSync(ragToolSpecPath, "utf8"))
+
+    const ragRetrieveTarget = new bedrockagentcore.CfnGatewayTarget(
+      this,
+      "RagRetrieveTarget",
+      {
+        gatewayIdentifier: this.gateway.attrGatewayIdentifier,
+        name:              "rag-retrieve-target",
+        description:       "RAG retrieve tool — vector similarity search over uploaded documents",
+        targetConfiguration: {
+          mcp: {
+            lambda: {
+              lambdaArn: ragRetrieveLambda.functionArn,
+              toolSchema: {
+                inlinePayload: ragToolSpec,
+              },
+            },
+          },
+        },
+        credentialProviderConfigurations: [
+          { credentialProviderType: "GATEWAY_IAM_ROLE" },
+        ],
+      }
+    )
+
+    // Dependency: target must be created after the gateway resource exists
+    ragRetrieveTarget.addDependency(this.gateway)
+
+    //    Outputs              ─
+    new cdk.CfnOutput(this, "RagRetrieveLambdaArn", {
+      value:       ragRetrieveLambda.functionArn,
+      description: "RAG Retrieve Lambda ARN (Phase 2D)",
+    })
+
+    new cdk.CfnOutput(this, "RagRetrieveTargetId", {
+      value:       ragRetrieveTarget.ref,
+      description: "AgentCore Gateway RAG Retrieve Target ID",
+    })
   }
 }
