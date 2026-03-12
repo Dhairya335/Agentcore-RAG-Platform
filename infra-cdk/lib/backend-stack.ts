@@ -980,16 +980,20 @@ export class BackendStack extends cdk.NestedStack {
     // Reads SSM at cold start to get Aurora ARNs — no hardcoded values.
     // Triggered by SQS batchSize=1 so each document is processed independently.
     // Timeout=15min matches queue visibilityTimeout — large PDFs can be slow.
-    const ingestionLambda = new lambda.Function(this, "IngestionWorkerLambda", {
+    // PythonFunction (not lambda.Function) auto-reads requirements.txt and bundles
+    // PyPDF2, python-docx, openpyxl, tiktoken into a Lambda layer at deploy time.
+    // lambda.Function + Code.fromAsset does NOT install pip dependencies.
+    const ingestionLambda = new PythonFunction(this, "IngestionWorkerLambda", {
       functionName: `${config.stack_name_base}-ingestion-worker`,
       runtime:      lambda.Runtime.PYTHON_3_13,
-      code:         lambda.Code.fromAsset(
-        path.join(__dirname, "..", "lambdas", "ingestion-worker")
-      ),
-      handler:      "index.handler",
+      entry:        path.join(__dirname, "..", "lambdas", "ingestion-worker"),
+      handler:      "handler",
       architecture: lambda.Architecture.ARM_64,
       timeout:      cdk.Duration.minutes(15),
-      memorySize:   1024,  // PDF parsing + embedding is memory intensive
+      memorySize:   1024,
+      bundling: {
+        platform: "linux/arm64",
+      },
       environment: {
         STACK_NAME:      config.stack_name_base,
         DOCS_TABLE_NAME: `${config.stack_name_base}-documents`,
