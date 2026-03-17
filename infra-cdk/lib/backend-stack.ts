@@ -922,8 +922,6 @@ export class BackendStack extends cdk.NestedStack {
 
     //    Phase 2D: GET /documents/{docId}/status                               
     // Returns the ingestion status of a document so the frontend can display
-    // "⏳ Indexing…" → "✅ Ready" or "❌ Failed" after upload.
-    //
     // Uses a plain lambda.Function (no pip deps — only boto3 which is built-in).
     // Reads the VER#000001 record from DynamoDB written by ingestion-worker.
     const docStatusLambda = new lambda.Function(this, "DocStatusLambda", {

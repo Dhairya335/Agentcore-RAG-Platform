@@ -583,16 +583,17 @@ def embed_text(text: str) -> list[float]:
 # Aurora — batch INSERT via RDS Data API
 
 def batch_insert_chunks(
-    db_cluster_arn: str,
-    db_secret_arn:  str,
-    db_name:        str,
-    tenant_id:      str,
-    doc_id:         str,
-    s3_key:         str,
-    file_name:      str,
-    source_type:    str,
-    embedded:       list[EmbeddedChunk],
-    chunk_total:    int,
+    db_cluster_arn:  str,
+    db_secret_arn:   str,
+    db_name:         str,
+    tenant_id:       str,
+    doc_id:          str,
+    s3_key:          str,
+    file_name:       str,
+    source_type:     str,
+    embedded:        list[EmbeddedChunk],
+    chunk_total:     int,
+    visibility_mode: str = "INTERNAL_ONLY",
 ):
     """
     Insert all chunks for a document in a single batch_execute_statement call.
@@ -604,18 +605,24 @@ def batch_insert_chunks(
 
     Note: batch_execute_statement does not support RETURNING, but we don't
     need the generated UUIDs — id is DEFAULT gen_random_uuid().
+
+    visibility_mode (Phase 3 RBAC):
+      - 'INTERNAL_ONLY'    — only INTERNAL role users can retrieve these chunks (default)
+      - 'EXTERNAL_ALLOWED' — both INTERNAL and EXTERNAL role users can retrieve
+      At ingest time, all chunks default to INTERNAL_ONLY. The visibility can be
+      changed later at the document or collection level via the management API.
     """
     sql = """
         INSERT INTO fast_chunks (
             tenant_id, doc_id, s3_key, file_name, source_type,
             chunk_index, chunk_total, content, embedding,
             page_number, section_title, heading_level,
-            sheet_name, row_start, row_end
+            sheet_name, row_start, row_end, visibility_mode
         ) VALUES (
             :tenant_id, :doc_id, :s3_key, :file_name, :source_type,
             :chunk_index, :chunk_total, :content, :embedding::vector,
             :page_number, :section_title, :heading_level,
-            :sheet_name, :row_start, :row_end
+            :sheet_name, :row_start, :row_end, :visibility_mode
         )
     """
 
@@ -630,21 +637,22 @@ def batch_insert_chunks(
         c              = ec.chunk
         vector_literal = "[" + ",".join(f"{v:.8f}" for v in ec.embedding) + "]"
         param_sets.append([
-            _str("tenant_id",     tenant_id),
-            _str("doc_id",        doc_id),
-            _str("s3_key",        s3_key),
-            _str("file_name",     file_name),
-            _str("source_type",   source_type),
-            _int("chunk_index",   c.chunk_index),
-            _int("chunk_total",   chunk_total),
-            _str("content",       _sanitise_text(c.content)),
-            _str("embedding",     vector_literal),
-            _int("page_number",   c.page_number),
-            _str("section_title", c.section_title),
-            _int("heading_level", c.heading_level),
-            _str("sheet_name",    c.sheet_name),
-            _int("row_start",     c.row_start),
-            _int("row_end",       c.row_end),
+            _str("tenant_id",       tenant_id),
+            _str("doc_id",          doc_id),
+            _str("s3_key",          s3_key),
+            _str("file_name",       file_name),
+            _str("source_type",     source_type),
+            _int("chunk_index",     c.chunk_index),
+            _int("chunk_total",     chunk_total),
+            _str("content",         _sanitise_text(c.content)),
+            _str("embedding",       vector_literal),
+            _int("page_number",     c.page_number),
+            _str("section_title",   c.section_title),
+            _int("heading_level",   c.heading_level),
+            _str("sheet_name",      c.sheet_name),
+            _int("row_start",       c.row_start),
+            _int("row_end",         c.row_end),
+            _str("visibility_mode", visibility_mode),
         ])
 
     rds_data.batch_execute_statement(
@@ -667,30 +675,70 @@ def update_doc_status(
     chunk_total:   int = 0,
     error_message: str = "",
 ):
+    """
+    Update the VER#{version} record status and, when READY, denormalize
+    chunkCount + status into the LATEST pointer record.
+
+    WHY denormalize into LATEST:
+      Phase 3 list-documents Lambda queries the GSI (tenantId-updatedAt-index)
+      which returns LATEST records. To avoid a second DynamoDB read (fan-out)
+      for each document's status and chunkCount, we store those fields directly
+      on the LATEST record here. One extra write at ingest time → zero extra
+      reads at list time. Clean O(1) list query.
+    """
     from datetime import datetime, timezone
 
-    pk = f"TENANT#{tenant_id}#DOC#{doc_id}"
-    sk = f"VER#{version:06d}"
+    now = datetime.now(timezone.utc).isoformat()
+    pk  = f"TENANT#{tenant_id}#DOC#{doc_id}"
+    sk  = f"VER#{version:06d}"
 
-    expr_parts:  list[str]      = ["#s = :status", "updatedAt = :now"]
-    expr_values: dict[str, Any] = {
+    # --- Update VER record ---
+    ver_expr_parts:  list[str]      = ["#s = :status", "updatedAt = :now"]
+    ver_expr_values: dict[str, Any] = {
         ":status": {"S": status},
-        ":now":    {"S": datetime.now(timezone.utc).isoformat()},
+        ":now":    {"S": now},
     }
 
     if status == "READY" and chunk_total:
-        expr_parts.append("chunkCount = :cc")
-        expr_values[":cc"] = {"N": str(chunk_total)}
+        ver_expr_parts.append("chunkCount = :cc")
+        ver_expr_values[":cc"] = {"N": str(chunk_total)}
 
     if status == "FAILED" and error_message:
-        expr_parts.append("errorMessage = :err")
-        expr_values[":err"] = {"S": error_message[:500]}
+        ver_expr_parts.append("errorMessage = :err")
+        ver_expr_values[":err"] = {"S": error_message[:500]}
 
     dynamodb.update_item(
         TableName=DOCS_TABLE_NAME,
         Key={"PK": {"S": pk}, "SK": {"S": sk}},
-        UpdateExpression="SET " + ", ".join(expr_parts),
-        ExpressionAttributeValues=expr_values,
+        UpdateExpression="SET " + ", ".join(ver_expr_parts),
+        ExpressionAttributeValues=ver_expr_values,
         ExpressionAttributeNames={"#s": "status"},
     )
     print(f"[DYNAMO] {pk} {sk} → {status}")
+
+    # --- Denormalize into LATEST record (Phase 3: enables O(1) list query) ---
+    # Only update LATEST when we have a definitive terminal status (READY or FAILED).
+    # UPLOADED is the initial status set by presign-upload Lambda — no update needed.
+    if status in ("READY", "FAILED"):
+        latest_expr_parts:  list[str]      = ["#s = :status", "updatedAt = :now"]
+        latest_expr_values: dict[str, Any] = {
+            ":status": {"S": status},
+            ":now":    {"S": now},
+        }
+
+        if status == "READY" and chunk_total:
+            latest_expr_parts.append("chunkCount = :cc")
+            latest_expr_values[":cc"] = {"N": str(chunk_total)}
+
+        if status == "FAILED" and error_message:
+            latest_expr_parts.append("errorMessage = :err")
+            latest_expr_values[":err"] = {"S": error_message[:500]}
+
+        dynamodb.update_item(
+            TableName=DOCS_TABLE_NAME,
+            Key={"PK": {"S": pk}, "SK": {"S": "LATEST"}},
+            UpdateExpression="SET " + ", ".join(latest_expr_parts),
+            ExpressionAttributeValues=latest_expr_values,
+            ExpressionAttributeNames={"#s": "status"},
+        )
+        print(f"[DYNAMO] {pk} LATEST → {status} (denormalized)")

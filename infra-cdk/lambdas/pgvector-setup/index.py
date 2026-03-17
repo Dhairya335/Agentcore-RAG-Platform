@@ -14,6 +14,7 @@ Custom Resource Lambda: Idempotent pgvector Schema Initialiser
       - vector embedding (1024 dims — Titan Embed V2)
       - full metadata for hybrid search (page, section, sheet, etc.)
       - source_type for per-type filtering
+      - visibility_mode for RBAC exposure control (Phase 3)
 """
 
 import json
@@ -44,29 +45,44 @@ SCHEMA_STATEMENTS = [
     #   row_start / row_end    — XLSX/CSV row range for this chunk (NULL for others)
     #   chunk_index            — position within this document version (0-based)
     #   chunk_total            — total chunks for this document version
+    #   visibility_mode        — RBAC exposure control (Phase 3 RBAC):
+    #                            'INTERNAL_ONLY'     = only INTERNAL role can retrieve
+    #                            'EXTERNAL_ALLOWED'  = both INTERNAL and EXTERNAL can retrieve
+    #                            Default: 'INTERNAL_ONLY' (fail-safe — new chunks are private
+    #                            until an admin explicitly marks them EXTERNAL_ALLOWED via a
+    #                            collection or per-document setting in Phase 3 management UI).
     """
     CREATE TABLE IF NOT EXISTS fast_chunks (
-        id            UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-        tenant_id     TEXT        NOT NULL,
-        doc_id        TEXT        NOT NULL,
-        s3_key        TEXT        NOT NULL,
-        file_name     TEXT        NOT NULL,
-        source_type   TEXT        NOT NULL,
-        chunk_index   INTEGER     NOT NULL,
-        chunk_total   INTEGER     NOT NULL,
-        content       TEXT        NOT NULL,
-        embedding     vector(1024),
-        page_number   INTEGER,
-        section_title TEXT,
-        heading_level INTEGER,
-        sheet_name    TEXT,
-        row_start     INTEGER,
-        row_end       INTEGER,
-        created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+        id              UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id       TEXT        NOT NULL,
+        doc_id          TEXT        NOT NULL,
+        s3_key          TEXT        NOT NULL,
+        file_name       TEXT        NOT NULL,
+        source_type     TEXT        NOT NULL,
+        chunk_index     INTEGER     NOT NULL,
+        chunk_total     INTEGER     NOT NULL,
+        content         TEXT        NOT NULL,
+        embedding       vector(1024),
+        page_number     INTEGER,
+        section_title   TEXT,
+        heading_level   INTEGER,
+        sheet_name      TEXT,
+        row_start       INTEGER,
+        row_end         INTEGER,
+        visibility_mode TEXT        NOT NULL DEFAULT 'INTERNAL_ONLY',
+        created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
     )
     """,
 
-    # 3. HNSW index for approximate nearest-neighbour vector search
+    # 3. Add visibility_mode column to existing tables (idempotent migration).
+    # IF NOT EXISTS for ADD COLUMN requires PostgreSQL 9.6+. Aurora PostgreSQL 16.4
+    # supports this. This statement is safe to run on both fresh and existing clusters.
+    """
+    ALTER TABLE fast_chunks
+    ADD COLUMN IF NOT EXISTS visibility_mode TEXT NOT NULL DEFAULT 'INTERNAL_ONLY'
+    """,
+
+    # 4. HNSW index for approximate nearest-neighbour vector search
     # WHY HNSW over IVFFlat:
     #   HNSW has better recall at query time and doesn't require a training step.
     #   vector_cosine_ops = cosine similarity — best for text embeddings.
@@ -78,13 +94,19 @@ SCHEMA_STATEMENTS = [
     WITH (m = 16, ef_construction = 64)
     """,
 
-    # 4. Supporting indexes for hybrid search filters
+    # 5. Supporting indexes for hybrid search filters
     # These let the query planner do: vector similarity + WHERE tenant_id = X
     # which is the core RAG retrieval pattern.
-    "CREATE INDEX IF NOT EXISTS fast_chunks_tenant_idx   ON fast_chunks (tenant_id)",
-    "CREATE INDEX IF NOT EXISTS fast_chunks_doc_idx      ON fast_chunks (doc_id)",
-    "CREATE INDEX IF NOT EXISTS fast_chunks_source_idx   ON fast_chunks (source_type)",
-    "CREATE INDEX IF NOT EXISTS fast_chunks_tenant_doc_idx ON fast_chunks (tenant_id, doc_id)",
+    "CREATE INDEX IF NOT EXISTS fast_chunks_tenant_idx        ON fast_chunks (tenant_id)",
+    "CREATE INDEX IF NOT EXISTS fast_chunks_doc_idx           ON fast_chunks (doc_id)",
+    "CREATE INDEX IF NOT EXISTS fast_chunks_source_idx        ON fast_chunks (source_type)",
+    "CREATE INDEX IF NOT EXISTS fast_chunks_tenant_doc_idx    ON fast_chunks (tenant_id, doc_id)",
+
+    # 6. Index on visibility_mode for fast retrieval filtering (Phase 3 RBAC).
+    # Used in the WHERE clause: visibility_mode = ANY(:allowed_visibility)
+    # Combined with tenant_id filter for the full retrieval query.
+    "CREATE INDEX IF NOT EXISTS fast_chunks_visibility_idx    ON fast_chunks (visibility_mode)",
+    "CREATE INDEX IF NOT EXISTS fast_chunks_tenant_vis_idx    ON fast_chunks (tenant_id, visibility_mode)",
 ]
 
 

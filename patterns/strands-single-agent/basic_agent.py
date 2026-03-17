@@ -15,6 +15,7 @@ from strands.tools.mcp import MCPClient
 from strands_code_interpreter import StrandsCodeInterpreterTools
 
 from utils.auth import extract_user_id_from_context, get_gateway_access_token
+from utils.role import get_user_role_from_context
 from utils.ssm import get_ssm_parameter
 
 app = BedrockAgentCoreApp()
@@ -54,7 +55,7 @@ def create_gateway_mcp_client(access_token: str) -> MCPClient:
     return gateway_client
 
 
-def create_basic_agent(user_id: str, session_id: str) -> Agent:
+def create_basic_agent(user_id: str, session_id: str, user_role: str = "EXTERNAL") -> Agent:
     """
     Create a basic agent with Gateway MCP tools and memory integration.
 
@@ -62,20 +63,38 @@ def create_basic_agent(user_id: str, session_id: str) -> Agent:
     and maintains conversation memory. It handles authentication, creates the MCP client
     connection, and configures the agent with access to all tools available through
     the Gateway. If Gateway connection fails, it falls back to an agent without tools.
+
+    Args:
+        user_id:   Cognito sub claim — used as tenantId for document scoping.
+        session_id: Runtime session ID for memory continuity.
+        user_role: "INTERNAL" or "EXTERNAL" — controls document access and citation format.
+                   INTERNAL: full document library access, full citations with docId.
+                   EXTERNAL: restricted to EXTERNAL_ALLOWED content, masked citations.
     """
+    # Role-aware citation format instruction
+    if user_role == "INTERNAL":
+        citation_format_instruction = """CITATION FORMAT (use exactly — internal user, full citations):
+  [Source: <file_name>, docId:<doc_id>, page <page_number>, chunk <X>/<Y>]
+  Example: "The encoder maps input to a continuous representation [Source: attention-paper.pdf, docId:abc-123, page 3, chunk 2/8]."
+  The docId field enables the Source Viewer. Always include it when present in the retrieved context."""
+        retrieval_role_instruction = f"""Always pass tenantId="{user_id}" and userRole="INTERNAL" when calling rag_retrieve_documents."""
+    else:
+        citation_format_instruction = """CITATION FORMAT (use exactly — external user, masked citations):
+  Answer the question based on the retrieved knowledge. Do not expose document names, file structures, or knowledge base organization.
+  When asked for sources, you may say "Based on our knowledge base" without revealing specific document details."""
+        retrieval_role_instruction = f"""Always pass tenantId="{user_id}" and userRole="EXTERNAL" when calling rag_retrieve_documents."""
+
     system_prompt = f"""You are a helpful assistant with access to the user's uploaded documents and a Code Interpreter.
 
 DOCUMENT RETRIEVAL RULES:
 1. Whenever the user asks a question that could be answered by their uploaded documents, you MUST call the rag_retrieve_documents tool FIRST before composing your answer.
-2. Always pass tenantId="{user_id}" when calling rag_retrieve_documents — this is the user's unique identifier that scopes the search to their documents only.
-3. If the tool returns a non-empty context_block, base your answer on the returned passages and cite every source inline using the exact format: [Source: <file_name>, page <N>].
+2. {retrieval_role_instruction}
+3. If the tool returns a non-empty context_block, base your answer on the returned passages and cite every source inline using the format below.
 4. If the tool returns chunks_found = 0 or an empty context_block, answer from your general knowledge and do NOT fabricate or imply any document source.
 5. Never claim a document says something that is not present verbatim in the returned context_block.
 6. If the user's question spans multiple topics, call rag_retrieve_documents once with the full question — the tool retrieves the most relevant passages across all of the user's documents automatically.
 
-CITATION FORMAT (use exactly):
-  [Source: <file_name>, page <page_number>]
-  Example: "The encoder maps the input to a continuous representation [Source: NIPS-2017-attention-is-all-you-need-Paper.pdf, page 3]."
+{citation_format_instruction}
 
 CODE INTERPRETER:
 Use the execute_python_securely tool when the user asks for calculations, data analysis, chart generation, or any task that benefits from running Python code.
@@ -104,7 +123,6 @@ GENERAL BEHAVIOUR:
 
     # Initialize Code Interpreter tools with boto3 session
     region = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
-    session = boto3.Session(region_name=region)
     code_tools = StrandsCodeInterpreterTools(region)
 
     try:
@@ -130,7 +148,8 @@ GENERAL BEHAVIOUR:
             model=bedrock_model,
             session_manager=session_manager,
             trace_attributes={
-                "user.id": user_id,
+                "user.id":   user_id,
+                "user.role": user_role,
                 "session.id": session_id,
             },
         )
@@ -157,10 +176,15 @@ async def agent_stream(payload, context: RequestContext):
 
     This is the function that AgentCore Runtime calls when the agent receives a request.
     It extracts the user's query from the payload, securely obtains the user ID from
-    the validated JWT token in the request context, creates an agent with Gateway tools
-    and memory, and streams the response back. This function handles the complete
-    request lifecycle with token-level streaming. The user ID is extracted from the 
-    JWT token (via RequestContext).
+    the validated JWT token in the request context, extracts the user's role from
+    Cognito groups in the JWT, creates an appropriately configured agent, and streams
+    the response back.
+
+    Role extraction (Phase 3 RBAC):
+      - user_id  → from JWT 'sub' claim (tenantId for document scoping)
+      - user_role → from JWT 'cognito:groups' claim via utils/role.py
+        INTERNAL: full access, full citations
+        EXTERNAL: restricted content, masked citations
     """
     user_query = payload.get("prompt")
     session_id = payload.get("runtimeSessionId")
@@ -177,12 +201,17 @@ async def agent_stream(payload, context: RequestContext):
         # instead of trusting the payload body (which could be manipulated)
         user_id = extract_user_id_from_context(context)
 
+        # Extract role from Cognito groups in JWT — drives access control
+        # throughout the entire request (retrieval visibility + citation format)
+        user_role = get_user_role_from_context(context)
+
         print(
-            f"[STREAM] Starting streaming invocation for user: {user_id}, session: {session_id}"
+            f"[STREAM] Starting streaming invocation for user: {user_id}, "
+            f"role: {user_role}, session: {session_id}"
         )
         print(f"[STREAM] Query: {user_query}")
 
-        agent = create_basic_agent(user_id, session_id)
+        agent = create_basic_agent(user_id, session_id, user_role)
 
         # Use the agent's stream_async method for true token-level streaming
         async for event in agent.stream_async(user_query):

@@ -15,7 +15,14 @@
         },
         "topK": {
           "type": "integer",
-          "description": "Number of document chunks to retrieve (1-8, default 5)."
+          "description": "Number of document chunks to retrieve (1-8, default 5).",
+          "minimum": 1,
+          "maximum": 8
+        },
+        "userRole": {
+          "type": "string",
+          "description": "The user's access role: INTERNAL (full document access, full citations) or EXTERNAL (restricted to externally-allowed content only, masked citations). Always pass this from the user's JWT claims. Default: EXTERNAL.",
+          "enum": ["INTERNAL", "EXTERNAL"]
         }
       },
       "required": ["query", "tenantId"]

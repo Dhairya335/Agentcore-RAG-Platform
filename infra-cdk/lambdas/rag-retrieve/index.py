@@ -84,15 +84,24 @@ def handler(event, context):
     tenant_id = body.get("tenantId", "").strip()
     top_k     = min(int(body.get("topK", TOP_K_DEFAULT)), TOP_K_MAX)
 
+    # Phase 3 RBAC: role passed by the agent from JWT claims.
+    # The agent extracts role using utils/role.py and forwards it as a tool parameter.
+    # INTERNAL → can retrieve both INTERNAL_ONLY and EXTERNAL_ALLOWED chunks.
+    # EXTERNAL → can only retrieve EXTERNAL_ALLOWED chunks.
+    # Default to EXTERNAL (fail-safe) if not provided.
+    user_role = body.get("userRole", "EXTERNAL").strip().upper()
+    if user_role not in ("INTERNAL", "EXTERNAL"):
+        user_role = "EXTERNAL"
+
     if not query:
         return _response(400, {"error": "query is required"})
     if not tenant_id:
         return _response(400, {"error": "tenantId is required"})
 
-    print(f"[RAG] query='{query[:80]}' tenant={tenant_id} topK={top_k}")
+    print(f"[RAG] query='{query[:80]}' tenant={tenant_id} topK={top_k} role={user_role}")
 
     try:
-        result = retrieve(query, tenant_id, top_k)
+        result = retrieve(query, tenant_id, top_k, user_role)
         return _response(200, result)
     except Exception as e:
         print(f"[RAG ERROR] {e}")
@@ -103,9 +112,26 @@ def handler(event, context):
 
 # Core retrieval logic
 
-def retrieve(query: str, tenant_id: str, top_k: int) -> dict:
+# RBAC visibility rules (Phase 3):
+# INTERNAL role → can see all visibility modes
+# EXTERNAL role → restricted to EXTERNAL_ALLOWED only
+VISIBILITY_BY_ROLE = {
+    "INTERNAL": ("INTERNAL_ONLY", "EXTERNAL_ALLOWED"),
+    "EXTERNAL": ("EXTERNAL_ALLOWED",),
+}
+
+
+def retrieve(query: str, tenant_id: str, top_k: int, user_role: str = "EXTERNAL") -> dict:
     """
     Full retrieval pipeline: embed → search → filter → format.
+
+    Args:
+        query:     The user's question text.
+        tenant_id: Cognito sub claim — scopes retrieval to this user's documents.
+        top_k:     Maximum number of chunks to return (capped at TOP_K_MAX=8).
+        user_role: "INTERNAL" or "EXTERNAL" — controls visibility_mode filter.
+                   INTERNAL → retrieves INTERNAL_ONLY + EXTERNAL_ALLOWED chunks.
+                   EXTERNAL → retrieves EXTERNAL_ALLOWED chunks only.
 
     Returns:
         {
@@ -114,6 +140,9 @@ def retrieve(query: str, tenant_id: str, top_k: int) -> dict:
             "query":         str,   # echo of original query
         }
     """
+    # Resolve allowed visibility modes for this role
+    allowed_visibility = VISIBILITY_BY_ROLE.get(user_role, VISIBILITY_BY_ROLE["EXTERNAL"])
+
     # Step 1 — Embed the query
     # Uses the same model + settings as ingestion-worker to ensure
     # vectors are comparable (same space, same normalisation).
@@ -124,7 +153,7 @@ def retrieve(query: str, tenant_id: str, top_k: int) -> dict:
     # then filter in Lambda to topK by similarity threshold.
     # This improves precision without a second DB round-trip.
     fetch_limit = top_k * 2
-    raw_chunks  = _vector_search(query_vector, tenant_id, fetch_limit)
+    raw_chunks  = _vector_search(query_vector, tenant_id, fetch_limit, allowed_visibility)
 
     # Step 3 — Similarity threshold filter
     # cosine similarity = 1 - cosine_distance
@@ -148,7 +177,9 @@ def retrieve(query: str, tenant_id: str, top_k: int) -> dict:
         }
 
     # Step 4 — Format context block
-    context_block = _format_context(final_chunks)
+    # INTERNAL users get full citations including docId (for Source Viewer in Phase 3.5).
+    # EXTERNAL users get masked citations — no knowledge structure exposed.
+    context_block = _format_context(final_chunks, user_role)
 
     return {
         "context_block": context_block,
@@ -187,9 +218,10 @@ def _embed_text(text: str) -> list[float]:
 # pgvector search via RDS Data API
 
 def _vector_search(
-    query_vector: list[float],
-    tenant_id:    str,
-    fetch_limit:  int,
+    query_vector:       list[float],
+    tenant_id:          str,
+    fetch_limit:        int,
+    allowed_visibility: tuple[str, ...] = ("EXTERNAL_ALLOWED",),
 ) -> list[dict]:
     """
     Cosine similarity search using pgvector HNSW index.
@@ -198,6 +230,11 @@ def _vector_search(
       - `embedding <=> :query_vec::vector` = cosine DISTANCE (0 = identical, 2 = opposite)
       - `1 - (embedding <=> ...)` = cosine SIMILARITY (1 = identical, -1 = opposite)
       - WHERE tenant_id = :tenant_id enforces multi-tenant isolation at the DB level
+      - WHERE visibility_mode = ANY(...) enforces RBAC at the DB level (Phase 3)
+        INTERNAL users see: INTERNAL_ONLY + EXTERNAL_ALLOWED
+        EXTERNAL users see: EXTERNAL_ALLOWED only
+        This is enforced in SQL — not just hidden in UI — so even a crafted tool
+        call cannot bypass the restriction.
       - ORDER BY distance ASC (closest first) + LIMIT = top-K approximate neighbours
       - The HNSW index on (embedding vector_cosine_ops) is used automatically
 
@@ -210,18 +247,27 @@ def _vector_search(
     # Serialise vector as PostgreSQL literal: [v1,v2,...,v1024]
     vector_literal = "[" + ",".join(f"{v:.8f}" for v in query_vector) + "]"
 
-    sql = """
+    # Build visibility IN clause — parameterised to prevent injection.
+    # RDS Data API does not support array parameters directly, so we build
+    # individual named params: :vis_0, :vis_1, etc.
+    vis_params     = [f":vis_{i}" for i in range(len(allowed_visibility))]
+    vis_clause     = ", ".join(vis_params)
+
+    sql = f"""
         SELECT
             content,
             file_name,
+            doc_id,
             chunk_index,
             chunk_total,
             page_number,
             section_title,
             source_type,
+            visibility_mode,
             1 - (embedding <=> :query_vec::vector) AS similarity
         FROM  fast_chunks
-        WHERE tenant_id = :tenant_id
+        WHERE tenant_id      = :tenant_id
+          AND visibility_mode IN ({vis_clause})
         ORDER BY embedding <=> :query_vec::vector
         LIMIT :fetch_limit
     """
@@ -231,6 +277,9 @@ def _vector_search(
         {"name": "tenant_id",   "value": {"stringValue": tenant_id}},
         {"name": "fetch_limit", "value": {"longValue":   fetch_limit}},
     ]
+    # Add one param per allowed visibility mode
+    for i, vis in enumerate(allowed_visibility):
+        params.append({"name": f"vis_{i}", "value": {"stringValue": vis}})
 
     response = rds_data.execute_statement(
         resourceArn=db_cluster_arn,
@@ -281,41 +330,51 @@ def _parse_rds_response(response: dict) -> list[dict]:
 
 # Context formatting
 
-def _format_context(chunks: list[dict]) -> str:
+def _format_context(chunks: list[dict], user_role: str = "EXTERNAL") -> str:
     """
     Format retrieved chunks into a context block for the agent prompt.
 
-    Each chunk is prefixed with a source citation line so the agent can
-    produce inline citations in the format [Source: file_name, page N].
+    Citation format by role (Phase 3 RBAC):
 
-    Format per chunk:
-        [Source: <file_name>, page <page_number>, chunk <index+1>/<total>]
+    INTERNAL role — full citation with docId for Source Viewer (Phase 3.5):
+        [Source: <file_name>, docId:<doc_id>, page <N>, chunk <X>/<Y>]
         <content>
 
-    Chunks are separated by "---" to visually delimit boundaries.
+    EXTERNAL role — masked citation, no knowledge structure exposed:
+        [Source: Internal Knowledge Base]
+        <content>
 
     Design note: the citation prefix is kept inside the context block
     (not as a separate metadata field) so the LLM sees it as part of
     the text it is summarising. This produces more natural inline citations.
+
+    The docId in INTERNAL citations is parsed by the frontend Source Viewer
+    component (Phase 3.5) to fetch and display the specific chunk.
     """
     parts = []
 
     for chunk in chunks:
         file_name   = chunk.get("file_name")   or "unknown"
+        doc_id      = chunk.get("doc_id")       or ""
         page_num    = chunk.get("page_number")
         chunk_index = chunk.get("chunk_index")
         chunk_total = chunk.get("chunk_total")
         content     = (chunk.get("content") or "").strip()
         similarity  = chunk.get("similarity", 0)
 
-        # Build citation header
-        page_part  = f", page {page_num}" if page_num is not None else ""
-        chunk_part = (
-            f", chunk {chunk_index + 1}/{chunk_total}"
-            if chunk_index is not None and chunk_total is not None
-            else ""
-        )
-        header = f"[Source: {file_name}{page_part}{chunk_part}]"
+        if user_role == "INTERNAL":
+            # Full citation — includes docId for Source Viewer linkage
+            page_part  = f", page {page_num}" if page_num is not None else ""
+            chunk_part = (
+                f", chunk {chunk_index + 1}/{chunk_total}"
+                if chunk_index is not None and chunk_total is not None
+                else ""
+            )
+            doc_id_part = f", docId:{doc_id}" if doc_id else ""
+            header = f"[Source: {file_name}{doc_id_part}{page_part}{chunk_part}]"
+        else:
+            # Masked citation — external users see answers, not knowledge structure
+            header = "[Source: Internal Knowledge Base]"
 
         print(f"[RAG] including chunk: {header} similarity={similarity:.3f}")
 
