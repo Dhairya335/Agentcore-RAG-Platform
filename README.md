@@ -77,11 +77,11 @@ This ensures:
 
 ## Project Structure
 
-frontend/ → UI and chat interface
-infra-cdk/ → AWS infrastructure (CDK)
-lambdas/ → ingestion + retrieval logic
-database/ → schema definitions
-docs/ → architecture and design
+- frontend/ → UI and chat interface
+- infra-cdk/ → AWS infrastructure (CDK)
+- lambdas/ → ingestion + retrieval logic
+- database/ → schema definitions
+- docs/ → architecture and design
 
 
 ---
