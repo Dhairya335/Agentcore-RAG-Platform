@@ -3,11 +3,13 @@
 
 import { Routes, Route } from 'react-router-dom'
 import ChatPage from './ChatPage'
+import DocumentLibraryPage from './DocumentLibraryPage'
 
 export default function AppRoutes() {
   return (
     <Routes>
-      <Route path="/" element={<ChatPage />} />
+      <Route path="/"           element={<ChatPage />} />
+      <Route path="/documents"  element={<DocumentLibraryPage />} />
     </Routes>
   )
 }

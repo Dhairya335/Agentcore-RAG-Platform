@@ -966,6 +966,86 @@ export class BackendStack extends cdk.NestedStack {
       }
     )
 
+    // ── Phase 3.1: GET /documents — List all documents for a tenant ──────────
+    // INTERNAL role only (enforced at Lambda level via Cognito JWT groups claim).
+    // Queries GSI tenantId-updatedAt-index on LATEST records only.
+    // LATEST records carry denormalized status + chunkCount (written by ingestion-worker).
+    const listDocumentsLambda = new lambda.Function(this, "ListDocumentsLambda", {
+      functionName: `${config.stack_name_base}-list-documents`,
+      runtime:      lambda.Runtime.PYTHON_3_13,
+      code:         lambda.Code.fromAsset(
+        path.join(__dirname, "..", "lambdas", "list-documents")
+      ),
+      handler:      "index.handler",
+      architecture: lambda.Architecture.ARM_64,
+      timeout:      cdk.Duration.seconds(15),
+      memorySize:   256,
+      environment: {
+        DOCS_TABLE_NAME:      docsTable.tableName,
+        CORS_ALLOWED_ORIGINS: `${frontendUrl},http://localhost:3000`,
+      },
+      logGroup: new logs.LogGroup(this, "ListDocumentsLogGroup", {
+        logGroupName:  `/aws/lambda/${config.stack_name_base}-list-documents`,
+        retention:     logs.RetentionDays.ONE_WEEK,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      }),
+    })
+    docsTable.grantReadData(listDocumentsLambda)
+
+    // Route: GET /documents
+    // documentsResource already created above for /documents/presign
+    documentsResource.addMethod(
+      "GET",
+      new apigateway.LambdaIntegration(listDocumentsLambda),
+      {
+        authorizer:        docsAuthorizer,
+        authorizationType: apigateway.AuthorizationType.COGNITO,
+        requestParameters: {
+          "method.request.querystring.tenantId":      true,
+          "method.request.querystring.limit":         false,
+          "method.request.querystring.nextPageToken": false,
+        },
+      }
+    )
+
+    // ── Phase 3.2: GET /documents/{docId} — Full document detail ─────────────
+    // INTERNAL role only. BatchGetItem on LATEST + VER#000001 in one round-trip.
+    // docItemResource already created above for /documents/{docId}/status
+    const getDocumentLambda = new lambda.Function(this, "GetDocumentLambda", {
+      functionName: `${config.stack_name_base}-get-document`,
+      runtime:      lambda.Runtime.PYTHON_3_13,
+      code:         lambda.Code.fromAsset(
+        path.join(__dirname, "..", "lambdas", "get-document")
+      ),
+      handler:      "index.handler",
+      architecture: lambda.Architecture.ARM_64,
+      timeout:      cdk.Duration.seconds(10),
+      memorySize:   256,
+      environment: {
+        DOCS_TABLE_NAME:      docsTable.tableName,
+        CORS_ALLOWED_ORIGINS: `${frontendUrl},http://localhost:3000`,
+      },
+      logGroup: new logs.LogGroup(this, "GetDocumentLogGroup", {
+        logGroupName:  `/aws/lambda/${config.stack_name_base}-get-document`,
+        retention:     logs.RetentionDays.ONE_WEEK,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      }),
+    })
+    docsTable.grantReadData(getDocumentLambda)
+
+    // Route: GET /documents/{docId}
+    docItemResource.addMethod(
+      "GET",
+      new apigateway.LambdaIntegration(getDocumentLambda),
+      {
+        authorizer:        docsAuthorizer,
+        authorizationType: apigateway.AuthorizationType.COGNITO,
+        requestParameters: {
+          "method.request.querystring.tenantId": true,
+        },
+      }
+    )
+
     // SSM: store docs API URL for frontend
     this.docsApiUrl = docsApi.url
     new ssm.StringParameter(this, "DocsApiUrlParam", {

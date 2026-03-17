@@ -285,3 +285,92 @@ function _sleep(ms: number, signal?: AbortSignal): Promise<void> {
     signal?.addEventListener("abort", () => { clearTimeout(timer); resolve() }, { once: true })
   })
 }
+
+// ── Phase 3.1 — Document Library ─────────────────────────────────────────────
+
+export interface DocumentListItem {
+  docId:         string
+  fileName:      string
+  latestVersion: number
+  status:        "UPLOADED" | "READY" | "FAILED"
+  chunkCount:    number | null
+  updatedAt:     string
+  contentType:   string | null
+  errorMessage:  string | null
+}
+
+export interface DocumentListResponse {
+  documents:     DocumentListItem[]
+  count:         number
+  nextPageToken: string | null
+}
+
+/**
+ * List all documents for a tenant.
+ * INTERNAL role only — returns 403 for EXTERNAL users.
+ *
+ * GET /documents?tenantId={tenantId}&limit={limit}&nextPageToken={token}
+ */
+export async function listDocuments(
+  tenantId:       string,
+  idToken:        string,
+  limit           = 20,
+  nextPageToken?: string,
+): Promise<DocumentListResponse> {
+  const base   = await loadDocsApiBase()
+  const params = new URLSearchParams({ tenantId, limit: String(limit) })
+  if (nextPageToken) params.set("nextPageToken", nextPageToken)
+
+  const resp = await fetch(`${base}documents?${params.toString()}`, {
+    headers: { Authorization: `Bearer ${idToken}` },
+  })
+
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}))
+    throw new Error(err.error || `List documents failed: HTTP ${resp.status}`)
+  }
+
+  return resp.json() as Promise<DocumentListResponse>
+}
+
+// ── Phase 3.2 — Document Detail ───────────────────────────────────────────────
+
+export interface DocumentDetail {
+  docId:         string
+  tenantId:      string
+  fileName:      string
+  latestVersion: number
+  status:        "UPLOADED" | "READY" | "FAILED"
+  chunkCount:    number | null
+  s3Key:         string | null
+  contentType:   string | null
+  createdAt:     string | null
+  updatedAt:     string | null
+  errorMessage:  string | null
+}
+
+/**
+ * Get full detail for a single document.
+ * INTERNAL role only — returns 403 for EXTERNAL users.
+ *
+ * GET /documents/{docId}?tenantId={tenantId}
+ */
+export async function getDocument(
+  docId:    string,
+  tenantId: string,
+  idToken:  string,
+): Promise<DocumentDetail> {
+  const base = await loadDocsApiBase()
+  const url  = `${base}documents/${encodeURIComponent(docId)}?tenantId=${encodeURIComponent(tenantId)}`
+
+  const resp = await fetch(url, {
+    headers: { Authorization: `Bearer ${idToken}` },
+  })
+
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}))
+    throw new Error(err.error || `Get document failed: HTTP ${resp.status}`)
+  }
+
+  return resp.json() as Promise<DocumentDetail>
+}

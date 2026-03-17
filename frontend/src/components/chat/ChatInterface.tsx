@@ -13,9 +13,10 @@ import { submitFeedback } from "@/services/feedbackService"
 import { useAuth } from "react-oidc-context"
 import { useDefaultTool } from "@/hooks/useToolRenderer"
 import { ToolCallDisplay } from "./ToolCallDisplay"
-// ── NEW ────────────────────────────────────────────────────────────────────
 import { DocumentUploadPanel } from "./DocumentUploadPanel"
 import type { UploadedDocument } from "@/services/documentService"
+import { KnowledgeBaseSidebar } from "@/components/knowledge/KnowledgeBaseSidebar"
+import { useIsInternal } from "@/hooks/useUserRole"
 
 export default function ChatInterface() {
   const [messages, setMessages] = useState<Message[]>([])
@@ -23,8 +24,9 @@ export default function ChatInterface() {
   const [error, setError] = useState<string | null>(null)
   const [client, setClient] = useState<AgentCoreClient | null>(null)
   const [sessionId] = useState(() => crypto.randomUUID())
-  // ── NEW: controls whether the upload panel is visible ─────────────────────
   const [isUploadPanelOpen, setIsUploadPanelOpen] = useState(false)
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false)
+  const isInternal = useIsInternal()
 
   const { isLoading, setIsLoading } = useGlobal()
   const auth = useAuth()
@@ -257,9 +259,16 @@ export default function ChatInterface() {
 
   return (
     <div className="flex flex-col h-screen w-full">
+      {isInternal && (
+        <KnowledgeBaseSidebar open={isSidebarOpen} onClose={() => setIsSidebarOpen(false)} />
+      )}
       {/* Fixed header */}
       <div className="flex-none">
-        <ChatHeader onNewChat={startNewChat} canStartNewChat={hasAssistantMessages} />
+        <ChatHeader
+          onNewChat={startNewChat}
+          canStartNewChat={hasAssistantMessages}
+          onLibraryOpen={() => setIsSidebarOpen(true)}
+        />
         {error && (
           <div className="bg-red-50 border-l-4 border-red-500 p-4 mx-4 mt-2">
             <p className="text-sm text-red-700">{error}</p>
