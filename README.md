@@ -1,181 +1,142 @@
-# Fullstack AgentCore Solution Template (FAST)
+# AgentCore RAG Platform
 
-_Author's note: for the official name for this solution is the "Fullstack Solution Template for Agentcore" but it is referred to throughout this code base as FAST for convenience._
+A production-grade AI Knowledge Operating System built on AWS Bedrock AgentCore, designed for secure, multi-tenant document ingestion, retrieval, and reasoning.
 
-The Fullstack AgentCore Solution Template (FAST) is a starter project repository that enables users (delivery scientists and engineers) to quickly deploy a secured, web-accessible React frontend connected to an AgentCore backend. Its purpose is to accelerate building full stack applications on AgentCore from weeks to days by handling the undifferentiated heavy lifting of infrastructure setup and to enable vibe-coding style development on top. The only central dependency of FAST is AgentCore. It is agnostic to agent SDK (Strands, LangGraph, etc) and to coding assistant platforms (Q, Kiro, Cline, Claude Code, etc).
+This project extends the AWS FAST (Fullstack AgentCore Solution Template) into a fully customized Retrieval-Augmented Generation (RAG) platform with advanced retrieval control, tenant isolation, and scalable ingestion pipelines.
 
-FAST is designed with security and vibe-codability as primary tenets. Best practices and knowledge from experts are codified in _documentation_ in this repository rather than in _code_. By including this documentation in an AI coding assistant's context, or by instructing the AI coding assistant to leverage best practices and code snippets found in the documentation, delivery scientists and developers can quickly vibe-build AgentCore applications for any use case. AI coding assistants can be used to fully customize the frontend and the cdk infrastructure, enabling scientists to focus the areas where their knowledge is most impactful: the actual prompt engineering and GenAI implementation details.
+This project is based on AWS FAST (Fullstack Solution Template for AgentCore), licensed under Apache 2.0, with significant architectural modifications.
 
-With FAST as a starting point and development framework, delivery scientists and engineers will accelerate their development process and deliver production quality AgentCore code following architecture and security best practices without having to learn any frontend or infrastructure (cdk) code.
+---
+
+## What This Is
+
+This is not a basic chatbot.
+
+This system is designed as:
+- A private AI knowledge system
+- A document ingestion and retrieval engine
+- A reasoning layer over structured and unstructured data
+
+It enables:
+- Secure document uploads per tenant
+- Semantic retrieval using vector embeddings
+- Context-aware response generation using LLMs
+- Source-grounded answers with traceability
+
+---
+
+## Architecture Overview
+
+High-level flow:
+
+Browser → Cognito Authentication → API Gateway → Presign Lambda → S3 Upload  
+→ S3 Event → SQS → Ingestion Lambda → Embedding (Titan V2) → Aurora pgvector  
+→ Query → Agent Runtime → Retrieval Lambda → Vector Search → Filter → LLM Response
+
+### Key Components
+
+- **Frontend**: React-based chat interface with document upload  
+- **Authentication**: AWS Cognito (JWT-based)  
+- **Storage**:  
+  - S3 (document storage)  
+  - DynamoDB (metadata + status)  
+  - Aurora PostgreSQL (pgvector for embeddings)  
+- **Ingestion Pipeline**: SQS + Lambda (asynchronous processing)  
+- **Embedding Model**: Amazon Titan Embed V2 (1024 dimensions)  
+- **Agent Runtime**: AWS Bedrock AgentCore  
+- **LLM**: Claude (via Bedrock)  
+
+---
+
+## Core Features
+
+- Multi-tenant document isolation  
+- Secure upload using presigned URLs  
+- Asynchronous ingestion pipeline (SQS + Lambda)  
+- Vector-based semantic retrieval (pgvector)  
+- Similarity filtering and controlled top-K retrieval  
+- LLM reasoning with grounded context  
+- Source attribution (chunk-level metadata)  
+
+---
+
+## Retrieval Strategy
+
+- Query embedding using Titan V2 (1024 dimensions)  
+- Candidate fetch: topK * 2 (SQL LIMIT)  
+- SQL fetch ceiling: 16  
+- Post-filtering in Lambda using similarity threshold (0.30)  
+- Final response context capped at topK (max 8)  
+
+This ensures:
+- high precision retrieval  
+- reduced hallucination  
+- controlled token usage  
+
+---
+
+## Project Structure
+
+frontend/ → UI and chat interface
+infra-cdk/ → AWS infrastructure (CDK)
+lambdas/ → ingestion + retrieval logic
+database/ → schema definitions
+docs/ → architecture and design
 
 
-## FAST Baseline System
+---
 
-FAST comes deployable out-of-the-box with a fully functioning, full-stack application. This application represents starts as a basic multi-turn chat agent where the backend agent has access to tools. **Do not let this deter you, even if your use case is entirely different! If your application requires AgentCore, customizing FAST to any use case is extremely straightforward. That is the intended use of FAST!**
+## Setup & Deployment
 
-The application is intentionally kept very, very simple to allow developers to easily build up whatever they want on top of the baseline. The tools shipped out of the box include:
+### Prerequisites
 
-1. **Gateway Tools** - Lambda-based tools behind AgentCore Gateway with authentication:
-   - Text analysis tool (counts words and letter frequency)
-   
-2. **Code Interpreter** - Direct integration with Amazon Bedrock AgentCore Code Interpreter:
-   - Secure Python code execution in isolated sandbox
-   - Session management with state persistence
-   - Pre-built runtime with common libraries
+- AWS account with Bedrock + AgentCore access  
+- Node.js  
+- AWS CDK  
+- Docker  
 
-Try asking the agent to analyze text or execute Python code to see these tools in action.
-
-
-## FAST User Setup
-
-If you are a delivery scientist or engineer who wants to use FAST to build a full stack application, this is the section for you.
-
-FAST is designed to be forked and deployed out of the box with a security-approved baseline system working. Your task will be to customize it to create your own full stack application to to do (literally) anything on AgentCore.
-
-Deploying the full stack out-of-the-box FAST baseline system is only a few cdk commands once you have forked the repo, namely: 
+### Deploy Infrastructure
 
 ```bash
 cd infra-cdk
 npm install
-cdk bootstrap # Once ever
+cdk bootstrap
 cdk deploy
-cd ..
-python scripts/deploy-frontend.py
 ```
 
-See the [deployment guide](docs/DEPLOYMENT.md) for detailed instructions on how to deploy FAST into an AWS account.
-
-### Local Development
-
-Local development requires a deployed FAST stack because the agent depends on AWS services that cannot run locally:
-- **AgentCore Memory** - stores conversation history
-- **AgentCore Gateway** - provides tool access via MCP
-- **SSM Parameters** - stores configuration (Gateway URL, client IDs)
-- **Secrets Manager** - stores Gateway authentication credentials
-
-You must first deploy the stack with `cdk deploy`, then you can run the frontend and agent locally using Docker Compose while connecting to these deployed AWS resources:
+### Run Frontend
 
 ```bash
-# Set required environment variables (see below for how to find these)
-export MEMORY_ID=your-memory-id
-export STACK_NAME=your-stack-name  
-export AWS_DEFAULT_REGION=us-east-1
-
-# Start the full stack locally
-cd docker
-docker-compose up --build
+cd frontend
+npm install
+npm run dev
 ```
 
-**Finding the environment variable values:**
-- `STACK_NAME`: Use the `stack_name_base` value from `infra-cdk/config.yaml`
-- `MEMORY_ID`: Extract from the `MemoryArn` CloudFormation output (the ID is the last segment after `/`)
-  ```bash
-  aws cloudformation describe-stacks --stack-name <your-stack-name> \
-    --query 'Stacks[0].Outputs[?OutputKey==`MemoryArn`].OutputValue' --output text
-  # Returns: arn:aws:bedrock-agentcore:region:account:memory/MEMORY_ID
-  ```
-- `AWS_DEFAULT_REGION`: The region where you deployed the stack (e.g., `us-east-1`)
+### Security
 
-See the [local development guide](docs/LOCAL_DEVELOPMENT.md) for detailed setup instructions.
+- JWT-based authentication via Cognito
+- Tenant isolation enforced at query layer
+- Private S3 buckets (no public access)
+- IAM least-privilege policies
 
-What comes next? That's up to you, the developer. With your requirements in mind, open up your coding assistant, describe what you'd like to do, and begin. The steering docs in this repository help guide coding assistants with best practices, and encourage them to always refer to the documentation built-in to the repository to make sure you end up building something great.
+Note: This project is not production-hardened by default. Security, compliance, and data protection must be implemented based on your use case.
 
+### Limitations
 
-## Architecture
+- No keyword fallback (vector-only retrieval)
+- No reranking (planned future enhancement)
+- Optimized for controlled datasets, not open web search
 
-![Architecture Diagram](docs/architecture-diagram/FAST-architecture-20251201.png)
+### Roadmap
 
-The out-of-the-box architecture is shown above. Note that Amazon Cognito is used in four places:
-1. User-based login to the frontend web application on CloudFront
-2. Token-based authentication for the frontend to access AgentCore Runtime
-3. Token-based authentication for the agents in AgentCore Runtime to access AgentCore Gateway
-4. Token-based authentication when making API requests to API Gateway.
+- Document management layer (collections, UI)
+- Advanced retrieval (section-aware, deduplication)
+- Observability and evaluation framework
+- Workflow automation (agent-driven tasks)
+- Multi-agent orchestration
 
-### Tech Stack
+### License
 
-- **Frontend**: React with TypeScript, Vite, Tailwind CSS, and shadcn components - infinitely flexible and ready for coding assistants
-- **Agent Providers**: Multiple agent providers supported (Strands, LangGraph, etc.) running within AgentCore Runtime
-- **Authentication**: AWS Cognito User Pool with OAuth support for easy swapping out Cognito
-- **Infrastructure**: CDK deployment with Amplify Hosting for frontend and AgentCore backend
+This project includes components derived from AWS FAST (Fullstack Solution Template for AgentCore), licensed under the Apache License 2.0.
 
-## Project Structure
-
-```
-fullstack-agentcore-solution-template/
-├── frontend/                 # React frontend application
-│   ├── src/
-│   │   ├── app/            # app router pages
-│   │   ├── components/     # React components (shadcn/ui)
-│   │   ├── hooks/          # Custom React hooks
-│   │   ├── lib/            # Utility libraries
-│   │   │   └── agentcore-client/ # AgentCore streaming client
-│   │   ├── services/       # API service layers
-│   │   └── types/          # TypeScript type definitions
-│   ├── public/             # Static assets and aws-exports.json
-│   ├── components.json     # shadcn/ui configuration
-│   ├── Dockerfile.dev      # Development container configuration
-│   └── package.json
-├── infra-cdk/               # CDK infrastructure code
-│   ├── lib/                # CDK stack definitions
-│   ├── bin/                # CDK app entry point
-│   ├── lambdas/            # Lambda function code
-│   └── config.yaml         # Deployment configuration
-├── patterns/               # Agent pattern implementations
-│   ├── strands-single-agent/ # Basic strands agent pattern
-│   │   ├── basic_agent.py  # Agent implementation
-│   │   ├── strands_code_interpreter.py # Code Interpreter wrapper
-│   │   ├── requirements.txt # Agent dependencies
-│   │   └── Dockerfile      # Container configuration
-│   └── langgraph-single-agent/ # LangGraph agent pattern
-│       ├── langgraph_agent.py # Agent implementation
-│       ├── requirements.txt # Agent dependencies
-│       └── Dockerfile      # Container configuration
-├── tools/                  # Reusable tools (framework-agnostic)
-│   └── code_interpreter/   # AgentCore Code Interpreter integration
-│       └── code_interpreter_tools.py # Core implementation
-├── gateway/                # Gateway utilities and tools
-│   ├── tools/              # Gateway tool implementations
-│   └── utils/              # Gateway utility functions
-├── scripts/                # Deployment and test scripts
-│   ├── deploy-frontend.py  # Cross-platform frontend deployment
-│   └── test-*.py          # Various test utilities
-├── docs/                   # Documentation source files
-│   ├── .nav.yml            # Navigation configuration
-│   ├── index.md            # Documentation landing page
-│   ├── DEPLOYMENT.md       # Deployment guide
-│   ├── LOCAL_DEVELOPMENT.md # Local development guide
-│   ├── AGENT_CONFIGURATION.md # Agent setup guide
-│   ├── MEMORY_INTEGRATION.md # Memory integration guide
-│   ├── GATEWAY.md          # Gateway integration guide
-│   ├── STREAMING.md        # Streaming implementation guide
-│   ├── TOOL_AC_CODE_INTERPRETER.md # Code Interpreter guide
-│   ├── VERSION_BUMP_PLAYBOOK.md # Version management
-│   └── architecture-diagram/ # Architecture diagrams
-├── .mkdocs/                # MkDocs build configuration
-│   ├── mkdocs.yml          # MkDocs configuration
-│   ├── requirements.txt    # Documentation dependencies
-│   ├── Makefile            # Build and deployment commands
-│   └── README.md           # Documentation system overview
-├── public/                 # Generated documentation site (MkDocs output)
-├── tests/                  # Test suite
-│   ├── unit/               # Unit tests
-│   ├── integration/        # Integration tests
-│   └── conftest.py         # Pytest configuration
-├── vibe-context/           # AI coding assistant context and rules
-│   ├── AGENTS.md           # Rules for AI assistants
-│   ├── coding-conventions.md # Code style guidelines
-│   └── development-best-practices.md # Development guidelines
-├── .kiro/                  # Kiro CLI configuration
-├── docker-compose.yml      # Local development stack
-└── README.md
-```
-
-## Security
-
-Note: this asset represents a proof-of-value for the services included and is not intended as a production-ready solution. You must determine how the AWS Shared Responsibility applies to their specific use case and implement the needed controls to achieve their desired security outcomes. AWS offers a broad set of security tools and configurations to enable our customers.
-
-Ultimately it is your responsibility as the developer of a full stack application to ensure all of its aspects are secure. We provide security best practices in repository documentation and provide a secure baseline but Amazon holds no responsibility for the security of applications built from this tool.
-
-## License
-
-This project is licensed under the Apache-2.0 License.
+All modifications and extensions are the work of this repository.
