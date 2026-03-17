@@ -791,6 +791,21 @@ export class BackendStack extends cdk.NestedStack {
       projectionType: dynamodb.ProjectionType.ALL,
     })
 
+    // GSI: list all collections for a tenant (Phase 3.3)
+    // entityType = "COLLECTION" on metadata items; tenantId is the tenant scope.
+    docsTable.addGlobalSecondaryIndex({
+      indexName: "entityType-tenantId-index",
+      partitionKey: {
+        name: "entityType",
+        type: dynamodb.AttributeType.STRING,
+      },
+      sortKey: {
+        name: "tenantId",
+        type: dynamodb.AttributeType.STRING,
+      },
+      projectionType: dynamodb.ProjectionType.ALL,
+    })
+
     // SSM: store table name so Lambdas can find it
     new ssm.StringParameter(this, "DocsTableParam", {
       parameterName: `/${config.stack_name_base}/rag/docs-table-name`,
@@ -1045,6 +1060,94 @@ export class BackendStack extends cdk.NestedStack {
         },
       }
     )
+
+    // Phase 3.3: Collections — create-collection, list-collections, collection-membership
+    // All three Lambdas share the same docsTable and CORS env vars.
+    // All routes sit under /collections on the same docsApi gateway.
+
+    const createCollectionLambda = new lambda.Function(this, "CreateCollectionLambda", {
+      functionName: `${config.stack_name_base}-create-collection`,
+      runtime:      lambda.Runtime.PYTHON_3_13,
+      code:         lambda.Code.fromAsset(path.join(__dirname, "..", "lambdas", "create-collection")),
+      handler:      "index.handler",
+      architecture: lambda.Architecture.ARM_64,
+      timeout:      cdk.Duration.seconds(10),
+      memorySize:   256,
+      environment: {
+        DOCS_TABLE_NAME:      docsTable.tableName,
+        CORS_ALLOWED_ORIGINS: `${frontendUrl},http://localhost:3000`,
+      },
+      logGroup: new logs.LogGroup(this, "CreateCollectionLogGroup", {
+        logGroupName:  `/aws/lambda/${config.stack_name_base}-create-collection`,
+        retention:     logs.RetentionDays.ONE_WEEK,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      }),
+    })
+    docsTable.grantReadWriteData(createCollectionLambda)
+
+    const listCollectionsLambda = new lambda.Function(this, "ListCollectionsLambda", {
+      functionName: `${config.stack_name_base}-list-collections`,
+      runtime:      lambda.Runtime.PYTHON_3_13,
+      code:         lambda.Code.fromAsset(path.join(__dirname, "..", "lambdas", "list-collections")),
+      handler:      "index.handler",
+      architecture: lambda.Architecture.ARM_64,
+      timeout:      cdk.Duration.seconds(10),
+      memorySize:   256,
+      environment: {
+        DOCS_TABLE_NAME:      docsTable.tableName,
+        CORS_ALLOWED_ORIGINS: `${frontendUrl},http://localhost:3000`,
+      },
+      logGroup: new logs.LogGroup(this, "ListCollectionsLogGroup", {
+        logGroupName:  `/aws/lambda/${config.stack_name_base}-list-collections`,
+        retention:     logs.RetentionDays.ONE_WEEK,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      }),
+    })
+    docsTable.grantReadData(listCollectionsLambda)
+
+    const collectionMembershipLambda = new lambda.Function(this, "CollectionMembershipLambda", {
+      functionName: `${config.stack_name_base}-collection-membership`,
+      runtime:      lambda.Runtime.PYTHON_3_13,
+      code:         lambda.Code.fromAsset(path.join(__dirname, "..", "lambdas", "collection-membership")),
+      handler:      "index.handler",
+      architecture: lambda.Architecture.ARM_64,
+      timeout:      cdk.Duration.seconds(10),
+      memorySize:   256,
+      environment: {
+        DOCS_TABLE_NAME:      docsTable.tableName,
+        CORS_ALLOWED_ORIGINS: `${frontendUrl},http://localhost:3000`,
+      },
+      logGroup: new logs.LogGroup(this, "CollectionMembershipLogGroup", {
+        logGroupName:  `/aws/lambda/${config.stack_name_base}-collection-membership`,
+        retention:     logs.RetentionDays.ONE_WEEK,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      }),
+    })
+    docsTable.grantReadWriteData(collectionMembershipLambda)
+
+    // Routes: /collections
+    const collectionsResource = docsApi.root.addResource("collections")
+
+    collectionsResource.addMethod("POST", new apigateway.LambdaIntegration(createCollectionLambda), {
+      authorizer: docsAuthorizer, authorizationType: apigateway.AuthorizationType.COGNITO,
+    })
+    collectionsResource.addMethod("GET", new apigateway.LambdaIntegration(listCollectionsLambda), {
+      authorizer: docsAuthorizer, authorizationType: apigateway.AuthorizationType.COGNITO,
+      requestParameters: { "method.request.querystring.tenantId": true },
+    })
+
+    // Routes: /collections/{colId}/documents and /collections/{colId}/documents/{docId}
+    const colItemResource  = collectionsResource.addResource("{colId}")
+    const colDocsResource  = colItemResource.addResource("documents")
+    const colDocIdResource = colDocsResource.addResource("{docId}")
+
+    colDocsResource.addMethod("POST", new apigateway.LambdaIntegration(collectionMembershipLambda), {
+      authorizer: docsAuthorizer, authorizationType: apigateway.AuthorizationType.COGNITO,
+    })
+    colDocIdResource.addMethod("DELETE", new apigateway.LambdaIntegration(collectionMembershipLambda), {
+      authorizer: docsAuthorizer, authorizationType: apigateway.AuthorizationType.COGNITO,
+      requestParameters: { "method.request.querystring.tenantId": true },
+    })
 
     // SSM: store docs API URL for frontend
     this.docsApiUrl = docsApi.url

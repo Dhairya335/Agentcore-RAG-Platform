@@ -14,6 +14,7 @@ import {
   type DocumentDetail,
 } from "@/services/documentService"
 import { BookOpen, RefreshCw, AlertCircle } from "lucide-react"
+import { CollectionManager } from "./CollectionManager"
 
 type View = "list" | "detail"
 
@@ -123,7 +124,12 @@ export function KnowledgeBaseSidebar({ open, onClose }: KnowledgeBaseSidebarProp
         <div className="flex-1 overflow-y-auto">
           {view === "detail"
             ? <DocumentDetailPanel doc={detail.doc!} detail={detail.detail} loading={detail.loading} error={detail.error} onBack={() => setView("list")} />
-            : <ListView list={list} onSelect={openDetail} onLoadMore={() => fetchList(list.nextPageToken ?? undefined)} />
+            : (
+              <>
+                <ListView list={list} onSelect={openDetail} onLoadMore={() => fetchList(list.nextPageToken ?? undefined)} />
+                <CollectionManager docs={list.docs} />
+              </>
+            )
           }
         </div>
 

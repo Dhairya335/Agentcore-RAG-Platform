@@ -374,3 +374,99 @@ export async function getDocument(
 
   return resp.json() as Promise<DocumentDetail>
 }
+
+// Phase 3.3 — Collections
+
+export type VisibilityMode = "INTERNAL_ONLY" | "EXTERNAL_ALLOWED"
+
+export interface Collection {
+  colId:          string
+  name:           string
+  description:    string
+  color:          string
+  visibilityMode: VisibilityMode
+  docCount:       number
+  createdAt:      string
+  updatedAt?:     string
+}
+
+export interface CollectionListResponse {
+  collections: Collection[]
+  count:       number
+}
+
+export async function listCollections(
+  tenantId: string,
+  idToken:  string,
+): Promise<CollectionListResponse> {
+  const base   = await loadDocsApiBase()
+  const params = new URLSearchParams({ tenantId })
+  const resp   = await fetch(`${base}collections?${params}`, {
+    headers: { Authorization: `Bearer ${idToken}` },
+  })
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}))
+    throw new Error(err.error || `List collections failed: HTTP ${resp.status}`)
+  }
+  return resp.json() as Promise<CollectionListResponse>
+}
+
+export async function createCollection(
+  tenantId:       string,
+  name:           string,
+  description:    string,
+  color:          string,
+  visibilityMode: VisibilityMode,
+  idToken:        string,
+): Promise<Collection> {
+  const base = await loadDocsApiBase()
+  const resp = await fetch(`${base}collections`, {
+    method:  "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${idToken}` },
+    body:    JSON.stringify({ tenantId, name, description, color, visibilityMode }),
+  })
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}))
+    throw new Error(err.error || `Create collection failed: HTTP ${resp.status}`)
+  }
+  return resp.json() as Promise<Collection>
+}
+
+export async function addDocumentToCollection(
+  colId:    string,
+  docId:    string,
+  tenantId: string,
+  idToken:  string,
+): Promise<void> {
+  const base = await loadDocsApiBase()
+  const resp = await fetch(`${base}collections/${encodeURIComponent(colId)}/documents`, {
+    method:  "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${idToken}` },
+    body:    JSON.stringify({ tenantId, docId }),
+  })
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}))
+    throw new Error(err.error || `Add to collection failed: HTTP ${resp.status}`)
+  }
+}
+
+export async function removeDocumentFromCollection(
+  colId:    string,
+  docId:    string,
+  tenantId: string,
+  idToken:  string,
+): Promise<void> {
+  const base   = await loadDocsApiBase()
+  const params = new URLSearchParams({ tenantId })
+  const resp   = await fetch(
+    `${base}collections/${encodeURIComponent(colId)}/documents/${encodeURIComponent(docId)}?${params}`,
+    {
+      method:  "DELETE",
+      headers: { Authorization: `Bearer ${idToken}` },
+    }
+  )
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}))
+    throw new Error(err.error || `Remove from collection failed: HTTP ${resp.status}`)
+  }
+}
