@@ -108,10 +108,17 @@ export class CognitoStack extends cdk.NestedStack {
     // Grant the post-confirmation Lambda permission to call AdminAddUserToGroup.
     // Without this, the trigger fires but throws AccessDeniedException — silent
     // to the user but logged in CloudWatch.
+    //
+    // NOTE: Using "*" instead of userPool.userPoolArn intentionally.
+    // Referencing userPool.userPoolArn here would create a circular dependency:
+    //   PostConfirmationLambda → IAM Policy → UserPool ARN → UserPool
+    //   UserPool → lambdaTriggers → PostConfirmationLambda
+    // CloudFormation cannot resolve this ordering. Using "*" breaks the cycle.
+    // The Lambda is scoped to the correct pool via its USER_POOL_ID env var at runtime.
     postConfirmationLambda.addToRolePolicy(new iam.PolicyStatement({
       effect:    iam.Effect.ALLOW,
       actions:   ["cognito-idp:AdminAddUserToGroup"],
-      resources: [userPool.userPoolArn],
+      resources: ["*"],
     }))
 
     // ── COGNITO GROUPS ────────────────────────────────────────────────────────
