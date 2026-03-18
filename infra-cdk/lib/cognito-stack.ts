@@ -86,10 +86,12 @@ export class CognitoStack extends cdk.NestedStack {
       },
       accountRecovery: cognito.AccountRecovery.EMAIL_ONLY,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
-      // Wire the post-confirmation trigger
-      lambdaTriggers: {
-        postConfirmation: postConfirmationLambda,
-      },
+      // NOTE: lambdaTriggers intentionally NOT set here.
+      // CDK's lambdaTriggers property auto-generates a UserPoolPostConfirmationCognito
+      // resource that creates a circular dependency:
+      //   UserPool → UserPoolPostConfirmationCognito → Lambda → UserPool
+      // Instead we wire the trigger directly on the CfnUserPool escape hatch below,
+      // which uses only the Lambda ARN (a string token) with no back-reference.
       userInvitation: {
         emailSubject: `Welcome to ${config.stack_name_base}!`,
         emailBody: `<p>Hello {username},</p>
@@ -104,6 +106,30 @@ export class CognitoStack extends cdk.NestedStack {
     // Inject the real User Pool ID now that the pool object exists.
     // CDK resolves this as a CloudFormation token reference — not a hardcoded string.
     postConfirmationLambda.addEnvironment("USER_POOL_ID", userPool.userPoolId)
+
+    // Wire the PostConfirmation trigger via the CfnUserPool escape hatch.
+    // This sets LambdaConfig.PostConfirmation directly in CloudFormation without
+    // generating the intermediate UserPoolPostConfirmationCognito resource that
+    // CDK's high-level lambdaTriggers property creates. That intermediate resource
+    // is what causes the circular dependency.
+    //
+    // The Lambda ARN is a pure string token — no UserPool object reference —
+    // so CloudFormation sees: Lambda (no UserPool dep) → CfnUserPool overrides
+    // (reads Lambda ARN string) with no cycle.
+    const cfnUserPool = userPool.node.defaultChild as cognito.CfnUserPool
+    cfnUserPool.addPropertyOverride(
+      "LambdaConfig.PostConfirmation",
+      postConfirmationLambda.functionArn
+    )
+
+    // Grant Cognito service permission to invoke the Lambda.
+    // Using addPermission (Lambda resource policy) rather than IAM role policy.
+    // Source account scopes it to this account only — no UserPool ARN reference needed.
+    postConfirmationLambda.addPermission("CognitoInvokePermission", {
+      principal:     new iam.ServicePrincipal("cognito-idp.amazonaws.com"),
+      action:        "lambda:InvokeFunction",
+      sourceAccount: cdk.Stack.of(this).account,
+    })
 
     // Grant the post-confirmation Lambda permission to call AdminAddUserToGroup.
     // Without this, the trigger fires but throws AccessDeniedException — silent
