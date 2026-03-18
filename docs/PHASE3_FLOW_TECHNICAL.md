@@ -41,34 +41,11 @@ event flow, state machine, and design decision for every Phase 3 checkpoint.
 
 ## CHECKPOINT A — RBAC Foundation
 
-### Phase 0 — CDK: Cognito Group Creation (cognito-stack.ts)
+### Phase 0 — CDK: Cognito Groups + PostConfirmation Trigger (cognito-stack.ts)
 
 ```
-CognitoStack.constructor()
+CognitoStack.createCognitoUserPool()
     ↓
-new cognito.CfnUserPoolGroup(this, "InternalGroup", {
-    userPoolId: userPool.userPoolId,
-    groupName:  "internal",
-    description: "Internal users — full knowledge base access",
-})
-    AWS SERVICE: Amazon Cognito User Pool
-    Creates a named group. Group membership is stored by Cognito and included
-    automatically in every ID token the user receives post-login.
-
-new cognito.CfnUserPoolGroup(this, "ExternalGroup", {
-    userPoolId: userPool.userPoolId,
-    groupName:  "external",
-    description: "External users — chat-only access",
-})
-
-new cognito.CfnUserPoolUserToGroupAttachment(this, "AdminToInternalGroup", {
-    userPoolId: userPool.userPoolId,
-    username:   adminUser.ref,
-    groupName:  "internal",
-})
-    Hardwires the CDK-defined admin user to the internal group at deploy time.
-    All other admin users must be manually added via Cognito console or CLI.
-
 new lambda.Function(this, "PostConfirmationLambda", {
     functionName: "{stack}-post-confirmation",
     runtime:      PYTHON_3_13,
@@ -77,27 +54,143 @@ new lambda.Function(this, "PostConfirmationLambda", {
     architecture: ARM_64,
     timeout:      Duration.seconds(10),
     environment: {
-        USER_POOL_ID:        userPool.userPoolId,
+        USER_POOL_ID:        "PLACEHOLDER",  ← overwritten below after pool creation
         EXTERNAL_GROUP_NAME: "external",
     },
 })
     AWS SERVICE: AWS Lambda
-
-userPool.addTrigger(
-    cognito.UserPoolOperation.POST_CONFIRMATION,
-    postConfirmationLambda,
-)
-    Wires the Lambda as a Cognito trigger.
-    Cognito calls this Lambda synchronously after every sign-up confirmation.
-    If Lambda throws, Cognito unwinds the confirmation. That is why errors are caught
-    and not re-raised in index.py.
-
+    NOTE: USER_POOL_ID starts as "PLACEHOLDER" because the pool doesn't exist yet.
+    CDK resolves it as a CloudFormation token reference after pool creation.
+    ↓
+new cognito.UserPool(this, "UserPool", {
+    selfSignUpEnabled: true,
+    signInAliases: { email: true },
+    autoVerify: { email: true },
+    passwordPolicy: { minLength:8, upper, lower, digits, symbols },
+    accountRecovery: EMAIL_ONLY,
+    removalPolicy: DESTROY,
+    // NOTE: lambdaTriggers intentionally NOT set here — circular dependency.
+    // See "Cognito Circular Dependency" section below for full explanation.
+})
+    AWS SERVICE: Amazon Cognito User Pool
+    ↓
+postConfirmationLambda.addEnvironment("USER_POOL_ID", userPool.userPoolId)
+    Injects real pool ID as a CFN token reference — resolved at deploy time, not synth.
+    ↓
 postConfirmationLambda.addToRolePolicy(new iam.PolicyStatement({
     actions:   ["cognito-idp:AdminAddUserToGroup"],
-    resources: [userPool.userPoolArn],
+    resources: ["*"],   ← "*" intentional — avoids circular dep on userPool.userPoolArn
 }))
     AWS SERVICE: IAM
-    Minimum-necessary grant: only AdminAddUserToGroup on exactly this pool.
+    Minimum-necessary grant: only AdminAddUserToGroup.
+```
+
+#### Cognito Circular Dependency — Root Cause and Fix
+
+**Problem:** Three approaches were attempted and all produced `UPDATE_FAILED: Circular dependency`:
+
+| Approach | Why it cycles |
+|----------|--------------|
+| `lambdaTriggers` in UserPool constructor | CDK auto-generates `UserPoolPostConfirmationCognito` resource that references both Lambda and UserPool in the same changeset |
+| `CfnUserPool.addPropertyOverride("LambdaConfig.PostConfirmation", ...)` | `Lambda::Permission` resource in same changeset creates implicit CFN ordering cycle |
+| `addPermission` with `sourceAccount` only | CFN dependency analyser still ties `Lambda::Permission` to the nested stack update containing the UserPool |
+
+**Root cause:** CloudFormation cannot update a UserPool's `LambdaConfig` in the same
+changeset as creating the `Lambda::Permission` that allows Cognito to invoke that Lambda.
+It is a chicken-and-egg ordering problem within a single CFN changeset.
+
+**Fix: `AwsCustomResource` (CDK custom-resources module)**
+
+Two `AwsCustomResource` constructs make direct AWS SDK calls **after** both the
+UserPool and Lambda are fully deployed. They are separate CFN resources with
+explicit `node.addDependency()` ordering:
+
+```
+PostConfirmationLambda (CREATE) — no UserPool reference
+    ↓
+UserPool (CREATE/UPDATE) — no LambdaConfig set yet
+    ↓
+TriggerWirerRole (CREATE) — IAM role for the custom resource Lambda
+    ↓
+PostConfirmationTriggerWirer (AwsCustomResource)
+    onCreate/onUpdate: CognitoIdentityProvider.updateUserPool({
+        UserPoolId: <pool-id>,
+        LambdaConfig: { PostConfirmation: <lambda-arn> }
+    })
+    onDelete: CognitoIdentityProvider.updateUserPool({
+        UserPoolId: <pool-id>,
+        LambdaConfig: {}    ← clears the trigger on stack teardown
+    })
+    installLatestAwsSdk: false   ← uses bundled SDK, avoids download at deploy time
+    ↓
+PostConfirmationInvokePermission (AwsCustomResource)
+    onCreate: Lambda.addPermission({
+        FunctionName:  <lambda-arn>,
+        StatementId:   "CognitoInvokePermission",
+        Action:        "lambda:InvokeFunction",
+        Principal:     "cognito-idp.amazonaws.com",
+        SourceAccount: <account-id>,
+    })
+    ignoreErrorCodesMatching: "ResourceConflictException"  ← idempotent on re-deploy
+    onDelete: Lambda.removePermission({
+        FunctionName: <lambda-arn>,
+        StatementId:  "CognitoInvokePermission",
+    })
+    ignoreErrorCodesMatching: "ResourceNotFoundException"  ← safe if already removed
+    installLatestAwsSdk: false
+```
+
+TriggerWirerRole inline policy:
+```json
+{
+  "cognito-idp:UpdateUserPool":   [userPool.userPoolArn],
+  "cognito-idp:DescribeUserPool": [userPool.userPoolArn],
+  "lambda:AddPermission":         [postConfirmationLambda.functionArn],
+  "lambda:RemovePermission":      [postConfirmationLambda.functionArn]
+}
+```
+
+Explicit dependency edges (ensures correct CFN ordering):
+```typescript
+triggerWirer.node.addDependency(postConfirmationLambda)
+triggerWirer.node.addDependency(userPool)
+addPermission.node.addDependency(postConfirmationLambda)
+```
+
+#### Cognito Groups
+
+```
+new cognito.CfnUserPoolGroup(this, "InternalGroup", {
+    userPoolId:  userPool.userPoolId,
+    groupName:   "internal",
+    description: "Internal users — full knowledge base access",
+})
+    AWS SERVICE: Amazon Cognito User Pool
+    Creates a named group. Group membership is stored by Cognito and included
+    automatically in every ID token the user receives post-login.
+
+new cognito.CfnUserPoolGroup(this, "ExternalGroup", {
+    userPoolId:  userPool.userPoolId,
+    groupName:   "external",
+    description: "External users — chat-only access",
+})
+
+internalGroup.node.addDependency(userPool)
+externalGroup.node.addDependency(userPool)
+```
+
+#### Admin User (if config.admin_user_email set)
+
+```
+new cognito.CfnUserPoolUserToGroupAttachment(this, "AdminToInternalGroup", {
+    userPoolId: userPool.userPoolId,
+    username:   adminUser.ref,
+    groupName:  "internal",
+})
+    Hardwires the CDK-defined admin user to the internal group at deploy time.
+    All other admin users must be manually added via Cognito console or CLI.
+    Admin-created users do NOT trigger PostConfirmation_ConfirmSignUp —
+    the post-confirmation Lambda will NOT run for them automatically.
 ```
 
 ### Phase 0B — CDK: pgvector-setup Lambda — visibility_mode column (pgvector-setup/index.py)
