@@ -4,3 +4,5 @@
 # PowerTools. In the CDK code it's installed as a layer, which means it's also not needed here. For
 # local development: pip install "aws-lambda-powertools[all]"
 pydantic
+urllib3==1.26.18
+requests==2.31.0
