@@ -1061,6 +1061,62 @@ export class BackendStack extends cdk.NestedStack {
       }
     )
 
+    // Phase 3.5: GET /documents/{docId}/chunks — preview-chunks Lambda
+    // Serves both DocumentDetailPanel (first N chunks) and SourceViewerDrawer (anchor window).
+    // Uses RDS Data API — same pattern as rag-retrieve. INTERNAL role only.
+    const previewChunksLambda = new lambda.Function(this, "PreviewChunksLambda", {
+      functionName: `${config.stack_name_base}-preview-chunks`,
+      runtime:      lambda.Runtime.PYTHON_3_13,
+      code:         lambda.Code.fromAsset(path.join(__dirname, "..", "lambdas", "preview-chunks")),
+      handler:      "index.handler",
+      architecture: lambda.Architecture.ARM_64,
+      timeout:      cdk.Duration.seconds(15),
+      memorySize:   256,
+      environment: {
+        STACK_NAME:           config.stack_name_base,
+        CORS_ALLOWED_ORIGINS: `${frontendUrl},http://localhost:3000`,
+      },
+      logGroup: new logs.LogGroup(this, "PreviewChunksLogGroup", {
+        logGroupName:  `/aws/lambda/${config.stack_name_base}-preview-chunks`,
+        retention:     logs.RetentionDays.ONE_WEEK,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      }),
+    })
+
+    // SSM read for Aurora connection params (same 3 keys as rag-retrieve)
+    previewChunksLambda.addToRolePolicy(new iam.PolicyStatement({
+      actions:   ["ssm:GetParameter"],
+      resources: [
+        `arn:aws:ssm:${this.region}:${this.account}:parameter/${config.stack_name_base}/rag/aurora-cluster-arn`,
+        `arn:aws:ssm:${this.region}:${this.account}:parameter/${config.stack_name_base}/rag/aurora-secret-arn`,
+        `arn:aws:ssm:${this.region}:${this.account}:parameter/${config.stack_name_base}/rag/aurora-db-name`,
+      ],
+    }))
+    previewChunksLambda.addToRolePolicy(new iam.PolicyStatement({
+      actions:   ["rds-data:ExecuteStatement"],
+      resources: ["*"],
+    }))
+    previewChunksLambda.addToRolePolicy(new iam.PolicyStatement({
+      actions:   ["secretsmanager:GetSecretValue"],
+      resources: ["*"],
+    }))
+
+    // Route: GET /documents/{docId}/chunks
+    const chunksResource = docItemResource.addResource("chunks")
+    chunksResource.addMethod(
+      "GET",
+      new apigateway.LambdaIntegration(previewChunksLambda),
+      {
+        authorizer:        docsAuthorizer,
+        authorizationType: apigateway.AuthorizationType.COGNITO,
+        requestParameters: {
+          "method.request.querystring.tenantId":   true,
+          "method.request.querystring.limit":      false,
+          "method.request.querystring.chunkIndex": false,
+        },
+      }
+    )
+
     // Phase 3.3: Collections — create-collection, list-collections, collection-membership
     // All three Lambdas share the same docsTable and CORS env vars.
     // All routes sit under /collections on the same docsApi gateway.
@@ -1603,7 +1659,9 @@ export class BackendStack extends cdk.NestedStack {
       timeout:      cdk.Duration.seconds(30),
       memorySize:   512,
       environment: {
-        STACK_NAME: config.stack_name_base,
+        STACK_NAME:      config.stack_name_base,
+        // Phase 3.4: needed for collection member resolution (_resolve_collection_members)
+        DOCS_TABLE_NAME: `${config.stack_name_base}-documents`,
       },
       logGroup: new logs.LogGroup(this, "RagRetrieveLogGroup", {
         logGroupName:  `/aws/lambda/${config.stack_name_base}-rag-retrieve`,
@@ -1651,6 +1709,14 @@ export class BackendStack extends cdk.NestedStack {
     // The Gateway executes tool calls by assuming its IAM role and invoking
     // the registered Lambda targets. grantInvoke adds lambda:InvokeFunction
     // to this.gatewayRole so it can call rag-retrieve in addition to sample-tool.
+    // Phase 3.4: DynamoDB read — resolve collection members for scoped retrieval
+    // Uses fromTableName because docsTable is created in createDocumentUploadInfra
+    // and createRagRetrieve is a separate method. Table name is deterministic.
+    const docsTableRef = dynamodb.Table.fromTableName(
+      this, "DocsTableRefForRag", `${config.stack_name_base}-documents`
+    )
+    docsTableRef.grantReadData(ragRetrieveLambda)
+
     ragRetrieveLambda.grantInvoke(this.gatewayRole)
 
     //    Gateway target: register rag-retrieve as a second MCP tool         

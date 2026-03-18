@@ -470,3 +470,53 @@ export async function removeDocumentFromCollection(
     throw new Error(err.error || `Remove from collection failed: HTTP ${resp.status}`)
   }
 }
+
+// Phase 3.5 — Chunk Preview + Source Viewer
+
+export interface ChunkPreview {
+  chunkIndex:   number
+  chunkTotal:   number
+  content:      string
+  pageNumber:   number | null
+  sectionTitle: string | null
+  sourceType:   string | null
+}
+
+export interface ChunkPreviewResponse {
+  chunks: ChunkPreview[]
+  count:  number
+}
+
+/**
+ * Fetch chunks from Aurora for a document.
+ *
+ * Two modes:
+ *   - Preview (chunkIndex omitted): first `limit` chunks ordered by chunk_index
+ *   - Anchor  (chunkIndex set):     window of `limit` chunks centred on chunkIndex
+ *
+ * INTERNAL only — returns 403 for EXTERNAL users.
+ * GET /documents/{docId}/chunks?tenantId=...&limit=...&chunkIndex=...
+ */
+export async function previewChunks(
+  docId:       string,
+  tenantId:    string,
+  idToken:     string,
+  limit        = 5,
+  chunkIndex?: number,
+): Promise<ChunkPreviewResponse> {
+  const base   = await loadDocsApiBase()
+  const params = new URLSearchParams({ tenantId, limit: String(limit) })
+  if (chunkIndex !== undefined) params.set("chunkIndex", String(chunkIndex))
+
+  const resp = await fetch(
+    `${base}documents/${encodeURIComponent(docId)}/chunks?${params}`,
+    { headers: { Authorization: `Bearer ${idToken}` } }
+  )
+
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}))
+    throw new Error(err.error || `Preview chunks failed: HTTP ${resp.status}`)
+  }
+
+  return resp.json() as Promise<ChunkPreviewResponse>
+}

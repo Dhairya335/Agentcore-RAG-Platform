@@ -6,14 +6,16 @@ import { Message } from "./types"
 import { FeedbackDialog } from "./FeedbackDialog"
 import { getToolRenderer } from "@/hooks/useToolRenderer"
 import { MarkdownRenderer } from "./MarkdownRenderer"
+import type { SourceViewerTarget } from "@/components/knowledge/SourceViewerDrawer"
 
 interface ChatMessageProps {
-  message: Message
-  sessionId: string
+  message:          Message
+  sessionId:        string
   onFeedbackSubmit: (feedbackType: "positive" | "negative", comment: string) => Promise<void>
+  onCitationClick?: (target: SourceViewerTarget) => void
 }
 
-export function ChatMessage({ message, sessionId: _sessionId, onFeedbackSubmit }: ChatMessageProps) {
+export function ChatMessage({ message, sessionId: _sessionId, onFeedbackSubmit, onCitationClick }: ChatMessageProps) {
   const [isDialogOpen, setIsDialogOpen] = useState(false)
   const [selectedFeedbackType, setSelectedFeedbackType] = useState<"positive" | "negative">(
     "positive"
@@ -39,7 +41,7 @@ export function ChatMessage({ message, sessionId: _sessionId, onFeedbackSubmit }
     if (message.segments && message.segments.length > 0) {
       return message.segments.map((seg, i) => {
         if (seg.type === "text") {
-          return <MarkdownRenderer key={i} content={seg.content} />;
+          return <MarkdownRenderer key={i} content={seg.content} onCitationClick={onCitationClick} />;
         }
         const render = getToolRenderer(seg.toolCall.name);
         if (!render) return null;
@@ -51,7 +53,7 @@ export function ChatMessage({ message, sessionId: _sessionId, onFeedbackSubmit }
       });
     }
     // Fallback: just render content as markdown
-    return <MarkdownRenderer content={message.content} />;
+    return <MarkdownRenderer content={message.content} onCitationClick={onCitationClick} />;
   };
 
   return (

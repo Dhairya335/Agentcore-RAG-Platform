@@ -59,13 +59,116 @@ const components: Record<string, any> = {
   },
 }
 
-export function MarkdownRenderer({ content }: { content: string }) {
+/**
+ * Citation chip parser — Phase 3.5
+ *
+ * Parses INTERNAL citation format emitted by rag-retrieve Lambda:
+ *   [Source: file.pdf, docId:abc-123, page 4, chunk 3/21]
+ *
+ * Regex captures: fileName, docId (optional), chunkIndex (optional).
+ * Returns null for any citation that lacks a docId (e.g., EXTERNAL masked citations).
+ */
+
+const CITATION_RE = /\[Source:\s*([^,\]]+?)(?:,\s*docId:([a-f0-9-]+))?(?:,\s*page\s*\d+)?(?:,\s*chunk\s*(\d+)\/\d+)?\]/g
+
+interface ParsedCitation {
+  raw:        string
+  fileName:   string
+  docId:      string
+  chunkIndex: number
+}
+
+function parseCitations(text: string): ParsedCitation[] {
+  const results: ParsedCitation[] = []
+  let m: RegExpExecArray | null
+  CITATION_RE.lastIndex = 0
+  while ((m = CITATION_RE.exec(text)) !== null) {
+    const docId = (m[2] ?? "").trim()
+    if (!docId) continue
+    results.push({
+      raw:        m[0],
+      fileName:   m[1].trim(),
+      docId,
+      chunkIndex: m[3] !== undefined ? parseInt(m[3], 10) - 1 : 0,
+    })
+  }
+  return results
+}
+
+/**
+ * Replace citation tokens in text with clickable chip spans.
+ * Splits on citation pattern, interleaves plain text with chips.
+ */
+function renderWithCitations(
+  text:    string,
+  onClick: (c: ParsedCitation) => void,
+): React.ReactNode[] {
+  const parts: React.ReactNode[] = []
+  let lastIndex = 0
+  let m: RegExpExecArray | null
+  let key = 0
+  CITATION_RE.lastIndex = 0
+
+  while ((m = CITATION_RE.exec(text)) !== null) {
+    const docId = (m[2] ?? "").trim()
+
+    // Plain text before this match
+    if (m.index > lastIndex) {
+      parts.push(text.slice(lastIndex, m.index))
+    }
+
+    if (docId) {
+      const citation: ParsedCitation = {
+        raw:        m[0],
+        fileName:   m[1].trim(),
+        docId,
+        chunkIndex: m[3] !== undefined ? parseInt(m[3], 10) - 1 : 0,
+      }
+      parts.push(
+        <button
+          key={key++}
+          onClick={() => onClick(citation)}
+          className="inline-flex items-center gap-1 text-xs text-blue-600 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded px-1.5 py-0.5 mx-0.5 font-medium transition-colors cursor-pointer"
+          title={`View source: ${citation.fileName}`}
+        >
+          📄 {citation.fileName}
+        </button>
+      )
+    } else {
+      // Citation without docId — render as plain text (EXTERNAL masked)
+      parts.push(<span key={key++} className="text-xs text-gray-400">{m[0]}</span>)
+    }
+
+    lastIndex = m.index + m[0].length
+  }
+
+  if (lastIndex < text.length) {
+    parts.push(text.slice(lastIndex))
+  }
+
+  return parts
+}
+
+type OnCitationClick = (target: { docId: string; fileName: string; chunkIndex: number }) => void
+
+export function MarkdownRenderer({ content, onCitationClick }: { content: string; onCitationClick?: OnCitationClick }) {
   if (!content) return null
+
+  // Only intercept citation rendering when an INTERNAL handler is provided.
+  // For EXTERNAL users (no handler), citations are never present (masked by Lambda).
+  const hasCitations = onCitationClick && CITATION_RE.test(content)
+  CITATION_RE.lastIndex = 0
+
   return (
     <div className="markdown-body leading-relaxed [&_p]:my-1.5 [&_ul]:my-1.5 [&_ul]:pl-5 [&_ul]:list-disc [&_ol]:my-1.5 [&_ol]:pl-5 [&_ol]:list-decimal [&_li]:my-0.5 [&_h1]:text-lg [&_h1]:font-semibold [&_h1]:mt-3 [&_h1]:mb-1.5 [&_h2]:text-base [&_h2]:font-semibold [&_h2]:mt-2.5 [&_h2]:mb-1 [&_h3]:text-sm [&_h3]:font-semibold [&_h3]:mt-2 [&_h3]:mb-1 [&_blockquote]:border-l-2 [&_blockquote]:border-gray-300 [&_blockquote]:pl-3 [&_blockquote]:my-1.5 [&_blockquote]:text-gray-600 [&_table]:my-2 [&_table]:min-w-full [&_table]:border-collapse [&_table]:text-xs [&_th]:px-2 [&_th]:py-1 [&_th]:bg-gray-100 [&_th]:border [&_th]:border-gray-300 [&_th]:text-left [&_th]:font-medium [&_td]:px-2 [&_td]:py-1 [&_td]:border [&_td]:border-gray-300 [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
-        {completePartialMarkdown(content)}
-      </ReactMarkdown>
+      {hasCitations
+        ? <p>{renderWithCitations(content, onCitationClick!)}</p>
+        : (
+          <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
+            {completePartialMarkdown(content)}
+          </ReactMarkdown>
+        )
+      }
     </div>
   )
 }

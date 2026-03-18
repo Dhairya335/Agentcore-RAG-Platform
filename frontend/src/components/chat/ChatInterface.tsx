@@ -16,6 +16,7 @@ import { ToolCallDisplay } from "./ToolCallDisplay"
 import { DocumentUploadPanel } from "./DocumentUploadPanel"
 import type { UploadedDocument } from "@/services/documentService"
 import { KnowledgeBaseSidebar } from "@/components/knowledge/KnowledgeBaseSidebar"
+import { SourceViewerDrawer, type SourceViewerTarget } from "@/components/knowledge/SourceViewerDrawer"
 import { useIsInternal } from "@/hooks/useUserRole"
 
 export default function ChatInterface() {
@@ -24,8 +25,9 @@ export default function ChatInterface() {
   const [error, setError] = useState<string | null>(null)
   const [client, setClient] = useState<AgentCoreClient | null>(null)
   const [sessionId] = useState(() => crypto.randomUUID())
-  const [isUploadPanelOpen, setIsUploadPanelOpen] = useState(false)
-  const [isSidebarOpen, setIsSidebarOpen] = useState(false)
+  const [isUploadPanelOpen, setIsUploadPanelOpen]     = useState(false)
+  const [isSidebarOpen, setIsSidebarOpen]             = useState(false)
+  const [sourceTarget, setSourceTarget]               = useState<SourceViewerTarget | null>(null)
   const isInternal = useIsInternal()
 
   const { isLoading, setIsLoading } = useGlobal()
@@ -262,6 +264,9 @@ export default function ChatInterface() {
       {isInternal && (
         <KnowledgeBaseSidebar open={isSidebarOpen} onClose={() => setIsSidebarOpen(false)} />
       )}
+      {isInternal && (
+        <SourceViewerDrawer target={sourceTarget} onClose={() => setSourceTarget(null)} />
+      )}
       {/* Fixed header */}
       <div className="flex-none">
         <ChatHeader
@@ -297,6 +302,7 @@ export default function ChatInterface() {
                 messagesEndRef={messagesEndRef}
                 sessionId={sessionId}
                 onFeedbackSubmit={handleFeedbackSubmit}
+                onCitationClick={isInternal ? setSourceTarget : undefined}
               />
             </div>
           </div>

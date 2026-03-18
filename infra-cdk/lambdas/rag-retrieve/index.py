@@ -29,14 +29,17 @@ import json
 import os
 
 import boto3
+from boto3.dynamodb.conditions import Key
 
 # AWS clients
-bedrock  = boto3.client("bedrock-runtime")
-rds_data = boto3.client("rds-data")
-ssm      = boto3.client("ssm")
+bedrock      = boto3.client("bedrock-runtime")
+rds_data     = boto3.client("rds-data")
+ssm          = boto3.client("ssm")
+dynamodb_res = boto3.resource("dynamodb")
 
 # Config
 STACK_NAME         = os.environ["STACK_NAME"]
+DOCS_TABLE_NAME    = os.environ.get("DOCS_TABLE_NAME", "")
 TOP_K_DEFAULT      = 5
 TOP_K_MAX          = 8
 SIMILARITY_CUTOFF  = 0.30   # discard chunks below this cosine similarity score
@@ -84,6 +87,14 @@ def handler(event, context):
     tenant_id = body.get("tenantId", "").strip()
     top_k     = min(int(body.get("topK", TOP_K_DEFAULT)), TOP_K_MAX)
 
+    # Phase 3.4 — scoped retrieval
+    # docIds: list of specific document UUIDs to restrict search to.
+    # collectionId: if provided, Lambda resolves member docIds from DynamoDB,
+    #               then applies the same docIds restriction.
+    # Both are optional — absence means "search all tenant documents" (current behaviour).
+    doc_ids      = body.get("docIds")       # list[str] or None
+    collection_id = body.get("collectionId") # str or None
+
     # Phase 3 RBAC: role passed by the agent from JWT claims.
     # The agent extracts role using utils/role.py and forwards it as a tool parameter.
     # INTERNAL → can retrieve both INTERNAL_ONLY and EXTERNAL_ALLOWED chunks.
@@ -98,10 +109,10 @@ def handler(event, context):
     if not tenant_id:
         return _response(400, {"error": "tenantId is required"})
 
-    print(f"[RAG] query='{query[:80]}' tenant={tenant_id} topK={top_k} role={user_role}")
+    print(f"[RAG] query='{query[:80]}' tenant={tenant_id} topK={top_k} role={user_role} scope=docIds:{doc_ids} col:{collection_id}")
 
     try:
-        result = retrieve(query, tenant_id, top_k, user_role)
+        result = retrieve(query, tenant_id, top_k, user_role, doc_ids=doc_ids, collection_id=collection_id)
         return _response(200, result)
     except Exception as e:
         print(f"[RAG ERROR] {e}")
@@ -121,7 +132,14 @@ VISIBILITY_BY_ROLE = {
 }
 
 
-def retrieve(query: str, tenant_id: str, top_k: int, user_role: str = "EXTERNAL") -> dict:
+def retrieve(
+    query:         str,
+    tenant_id:     str,
+    top_k:         int,
+    user_role:     str = "EXTERNAL",
+    doc_ids:       list | None = None,
+    collection_id: str | None = None,
+) -> dict:
     """
     Full retrieval pipeline: embed → search → filter → format.
 
@@ -143,6 +161,18 @@ def retrieve(query: str, tenant_id: str, top_k: int, user_role: str = "EXTERNAL"
     # Resolve allowed visibility modes for this role
     allowed_visibility = VISIBILITY_BY_ROLE.get(user_role, VISIBILITY_BY_ROLE["EXTERNAL"])
 
+    # Phase 3.4 — resolve scoped doc_ids
+    # collectionId takes precedence: resolve membership from DynamoDB, union with any
+    # explicit docIds. Result is a de-duped set; empty set means no restriction.
+    resolved_doc_ids: list[str] = []
+    if collection_id and DOCS_TABLE_NAME:
+        resolved_doc_ids = _resolve_collection_members(tenant_id, collection_id)
+        print(f"[RAG] collection {collection_id} resolved to {len(resolved_doc_ids)} docs")
+    if doc_ids:
+        # Union: set guarantees no duplicates, list preserves determinism
+        merged = set(resolved_doc_ids) | set(doc_ids)
+        resolved_doc_ids = list(merged)
+
     # Step 1 — Embed the query
     # Uses the same model + settings as ingestion-worker to ensure
     # vectors are comparable (same space, same normalisation).
@@ -153,7 +183,7 @@ def retrieve(query: str, tenant_id: str, top_k: int, user_role: str = "EXTERNAL"
     # then filter in Lambda to topK by similarity threshold.
     # This improves precision without a second DB round-trip.
     fetch_limit = top_k * 2
-    raw_chunks  = _vector_search(query_vector, tenant_id, fetch_limit, allowed_visibility)
+    raw_chunks  = _vector_search(query_vector, tenant_id, fetch_limit, allowed_visibility, resolved_doc_ids)
 
     # Step 3 — Similarity threshold filter
     # cosine similarity = 1 - cosine_distance
@@ -186,6 +216,25 @@ def retrieve(query: str, tenant_id: str, top_k: int, user_role: str = "EXTERNAL"
         "chunks_found":  len(final_chunks),
         "query":         query,
     }
+
+
+# Collection membership resolver (Phase 3.4)
+
+def _resolve_collection_members(tenant_id: str, collection_id: str) -> list[str]:
+    """
+    Query DynamoDB for all DOC#{docId} SK items under the collection PK.
+    Returns a list of docIds that belong to this collection for this tenant.
+    Uses KeyConditionExpression with begins_with on SK = 'DOC#' to retrieve
+    only membership records, not the METADATA record.
+    O(N) where N = number of docs in the collection — acceptable at personal scale.
+    """
+    table = dynamodb_res.Table(DOCS_TABLE_NAME)
+    pk    = f"TENANT#{tenant_id}#COL#{collection_id}"
+
+    resp = table.query(
+        KeyConditionExpression=Key("PK").eq(pk) & Key("SK").begins_with("DOC#")
+    )
+    return [item["SK"][4:] for item in resp.get("Items", [])]  # strip "DOC#" prefix
 
 
 # Embedding
@@ -222,6 +271,7 @@ def _vector_search(
     tenant_id:          str,
     fetch_limit:        int,
     allowed_visibility: tuple[str, ...] = ("EXTERNAL_ALLOWED",),
+    doc_ids:            list[str] | None = None,
 ) -> list[dict]:
     """
     Cosine similarity search using pgvector HNSW index.
@@ -250,8 +300,15 @@ def _vector_search(
     # Build visibility IN clause — parameterised to prevent injection.
     # RDS Data API does not support array parameters directly, so we build
     # individual named params: :vis_0, :vis_1, etc.
-    vis_params     = [f":vis_{i}" for i in range(len(allowed_visibility))]
-    vis_clause     = ", ".join(vis_params)
+    vis_params = [f":vis_{i}" for i in range(len(allowed_visibility))]
+    vis_clause = ", ".join(vis_params)
+
+    # Phase 3.4 — optional doc_id scope clause
+    # Only added when doc_ids is a non-empty list. Same per-param pattern as visibility.
+    doc_clause = ""
+    if doc_ids:
+        doc_params_names = [f":doc_{i}" for i in range(len(doc_ids))]
+        doc_clause = f"AND doc_id IN ({', '.join(doc_params_names)})"
 
     sql = f"""
         SELECT
@@ -268,6 +325,7 @@ def _vector_search(
         FROM  fast_chunks
         WHERE tenant_id      = :tenant_id
           AND visibility_mode IN ({vis_clause})
+          {doc_clause}
         ORDER BY embedding <=> :query_vec::vector
         LIMIT :fetch_limit
     """
@@ -277,9 +335,11 @@ def _vector_search(
         {"name": "tenant_id",   "value": {"stringValue": tenant_id}},
         {"name": "fetch_limit", "value": {"longValue":   fetch_limit}},
     ]
-    # Add one param per allowed visibility mode
     for i, vis in enumerate(allowed_visibility):
         params.append({"name": f"vis_{i}", "value": {"stringValue": vis}})
+    if doc_ids:
+        for i, did in enumerate(doc_ids):
+            params.append({"name": f"doc_{i}", "value": {"stringValue": did}})
 
     response = rds_data.execute_statement(
         resourceArn=db_cluster_arn,

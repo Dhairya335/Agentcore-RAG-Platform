@@ -23,6 +23,15 @@
           "type": "string",
           "description": "The user's access role: INTERNAL (full document access, full citations) or EXTERNAL (restricted to externally-allowed content only, masked citations). Always pass this from the user's JWT claims. Default: EXTERNAL.",
           "enum": ["INTERNAL", "EXTERNAL"]
+        },
+        "docIds": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Optional. Restrict search to these specific document UUIDs only. Use when the user says 'in that document' or selects a specific document. Omit to search all tenant documents."
+        },
+        "collectionId": {
+          "type": "string",
+          "description": "Optional. Restrict search to documents in this collection. The Lambda resolves collection members from DynamoDB and applies the scope at the SQL layer."
         }
       },
       "required": ["query", "tenantId"]
