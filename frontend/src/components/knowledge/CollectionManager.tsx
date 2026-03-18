@@ -20,15 +20,6 @@ import { cn } from "@/lib/utils"
 const COLOR_OPTIONS = ["blue", "purple", "green", "orange", "red", "gray"] as const
 type Color = typeof COLOR_OPTIONS[number]
 
-const COLOR_CLASS: Record<Color, string> = {
-  blue:   "bg-blue-100   text-blue-700",
-  purple: "bg-purple-100 text-purple-700",
-  green:  "bg-green-100  text-green-700",
-  orange: "bg-orange-100 text-orange-700",
-  red:    "bg-red-100    text-red-700",
-  gray:   "bg-gray-100   text-gray-600",
-}
-
 const DOT_CLASS: Record<Color, string> = {
   blue:   "bg-blue-500",
   purple: "bg-purple-500",

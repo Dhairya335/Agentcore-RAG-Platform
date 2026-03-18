@@ -78,23 +78,6 @@ interface ParsedCitation {
   chunkIndex: number
 }
 
-function parseCitations(text: string): ParsedCitation[] {
-  const results: ParsedCitation[] = []
-  let m: RegExpExecArray | null
-  CITATION_RE.lastIndex = 0
-  while ((m = CITATION_RE.exec(text)) !== null) {
-    const docId = (m[2] ?? "").trim()
-    if (!docId) continue
-    results.push({
-      raw:        m[0],
-      fileName:   m[1].trim(),
-      docId,
-      chunkIndex: m[3] !== undefined ? parseInt(m[3], 10) - 1 : 0,
-    })
-  }
-  return results
-}
-
 /**
  * Replace citation tokens in text with clickable chip spans.
  * Splits on citation pattern, interleaves plain text with chips.
