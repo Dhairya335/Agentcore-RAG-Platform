@@ -191,7 +191,7 @@ export class CognitoStack extends cdk.NestedStack {
         },
         physicalResourceId: cr.PhysicalResourceId.of("PostConfirmationTriggerWirer"),
       },
-      installLatestAwsSdk: false,
+      installLatestAwsSdk: true,
     })
 
     // AddPermission is a separate custom resource so it can be idempotent
@@ -221,7 +221,7 @@ export class CognitoStack extends cdk.NestedStack {
         physicalResourceId:    cr.PhysicalResourceId.of("PostConfirmationInvokePermission"),
         ignoreErrorCodesMatching: "ResourceNotFoundException",
       },
-      installLatestAwsSdk: false,
+      installLatestAwsSdk: true,
     })
 
     // Explicit ordering: Lambda and UserPool must exist before the wirer runs.
