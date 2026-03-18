@@ -3,6 +3,7 @@ import * as cognito from "aws-cdk-lib/aws-cognito"
 import * as lambda from "aws-cdk-lib/aws-lambda"
 import * as iam from "aws-cdk-lib/aws-iam"
 import * as logs from "aws-cdk-lib/aws-logs"
+import * as cr from "aws-cdk-lib/custom-resources"
 import { Construct } from "constructs"
 import { AppConfig } from "./utils/config-manager"
 import * as path from "path"
@@ -107,45 +108,126 @@ export class CognitoStack extends cdk.NestedStack {
     // CDK resolves this as a CloudFormation token reference — not a hardcoded string.
     postConfirmationLambda.addEnvironment("USER_POOL_ID", userPool.userPoolId)
 
-    // Wire the PostConfirmation trigger via the CfnUserPool escape hatch.
-    // This sets LambdaConfig.PostConfirmation directly in CloudFormation without
-    // generating the intermediate UserPoolPostConfirmationCognito resource that
-    // CDK's high-level lambdaTriggers property creates. That intermediate resource
-    // is what causes the circular dependency.
-    //
-    // The Lambda ARN is a pure string token — no UserPool object reference —
-    // so CloudFormation sees: Lambda (no UserPool dep) → CfnUserPool overrides
-    // (reads Lambda ARN string) with no cycle.
-    const cfnUserPool = userPool.node.defaultChild as cognito.CfnUserPool
-    cfnUserPool.addPropertyOverride(
-      "LambdaConfig.PostConfirmation",
-      postConfirmationLambda.functionArn
-    )
-
-    // Grant Cognito service permission to invoke the Lambda.
-    // Using addPermission (Lambda resource policy) rather than IAM role policy.
-    // Source account scopes it to this account only — no UserPool ARN reference needed.
-    postConfirmationLambda.addPermission("CognitoInvokePermission", {
-      principal:     new iam.ServicePrincipal("cognito-idp.amazonaws.com"),
-      action:        "lambda:InvokeFunction",
-      sourceAccount: cdk.Stack.of(this).account,
-    })
-
     // Grant the post-confirmation Lambda permission to call AdminAddUserToGroup.
-    // Without this, the trigger fires but throws AccessDeniedException — silent
-    // to the user but logged in CloudWatch.
-    //
-    // NOTE: Using "*" instead of userPool.userPoolArn intentionally.
-    // Referencing userPool.userPoolArn here would create a circular dependency:
-    //   PostConfirmationLambda → IAM Policy → UserPool ARN → UserPool
-    //   UserPool → lambdaTriggers → PostConfirmationLambda
-    // CloudFormation cannot resolve this ordering. Using "*" breaks the cycle.
-    // The Lambda is scoped to the correct pool via its USER_POOL_ID env var at runtime.
+    // Using "*" resource to avoid any UserPool ARN reference before the pool exists.
     postConfirmationLambda.addToRolePolicy(new iam.PolicyStatement({
       effect:    iam.Effect.ALLOW,
       actions:   ["cognito-idp:AdminAddUserToGroup"],
       resources: ["*"],
     }))
+
+    // ── TRIGGER WIRING VIA CUSTOM RESOURCE ────────────────────────────────────
+    // Problem: wiring the PostConfirmation trigger in CDK (via lambdaTriggers,
+    // addTrigger, or CfnUserPool escape hatch) always creates a circular dependency
+    // in CloudFormation when the UserPool already exists:
+    //   UserPool update (LambdaConfig) ←→ Lambda::Permission (references UserPool)
+    //
+    // Solution: use AwsCustomResource to call UpdateUserPool + AddPermission as
+    // SDK calls AFTER both the UserPool and Lambda are fully deployed. The Custom
+    // Resource runs in a separate CloudFormation resource with explicit DependsOn,
+    // so the ordering is: Lambda created → UserPool updated → Custom Resource runs.
+    //
+    // The Custom Resource role needs only two permissions:
+    //   cognito-idp:UpdateUserPool  — to set LambdaConfig.PostConfirmation
+    //   lambda:AddPermission        — to grant cognito-idp.amazonaws.com invoke rights
+
+    const triggerWirerRole = new iam.Role(this, "TriggerWirerRole", {
+      assumedBy: new iam.ServicePrincipal("lambda.amazonaws.com"),
+      managedPolicies: [
+        iam.ManagedPolicy.fromAwsManagedPolicyName("service-role/AWSLambdaBasicExecutionRole"),
+      ],
+      inlinePolicies: {
+        TriggerWirer: new iam.PolicyDocument({
+          statements: [
+            new iam.PolicyStatement({
+              actions:   ["cognito-idp:UpdateUserPool", "cognito-idp:DescribeUserPool"],
+              resources: [userPool.userPoolArn],
+            }),
+            new iam.PolicyStatement({
+              actions:   ["lambda:AddPermission", "lambda:RemovePermission"],
+              resources: [postConfirmationLambda.functionArn],
+            }),
+          ],
+        }),
+      },
+    })
+
+    // AwsCustomResource makes two SDK calls on Create/Update:
+    // 1. cognito-idp.UpdateUserPool — sets LambdaConfig.PostConfirmation
+    // 2. lambda.AddPermission       — grants cognito-idp.amazonaws.com invoke access
+    //
+    // On Delete (stack teardown), UpdateUserPool clears the trigger.
+    // RemovePermission is best-effort (ignores ResourceNotFoundException).
+    const triggerWirer = new cr.AwsCustomResource(this, "PostConfirmationTriggerWirer", {
+      role: triggerWirerRole,
+      onCreate: {
+        service:    "CognitoIdentityProvider",
+        action:     "updateUserPool",
+        parameters: {
+          UserPoolId: userPool.userPoolId,
+          LambdaConfig: {
+            PostConfirmation: postConfirmationLambda.functionArn,
+          },
+        },
+        physicalResourceId: cr.PhysicalResourceId.of("PostConfirmationTriggerWirer"),
+      },
+      onUpdate: {
+        service:    "CognitoIdentityProvider",
+        action:     "updateUserPool",
+        parameters: {
+          UserPoolId: userPool.userPoolId,
+          LambdaConfig: {
+            PostConfirmation: postConfirmationLambda.functionArn,
+          },
+        },
+        physicalResourceId: cr.PhysicalResourceId.of("PostConfirmationTriggerWirer"),
+      },
+      onDelete: {
+        service:    "CognitoIdentityProvider",
+        action:     "updateUserPool",
+        parameters: {
+          UserPoolId:   userPool.userPoolId,
+          LambdaConfig: {},
+        },
+        physicalResourceId: cr.PhysicalResourceId.of("PostConfirmationTriggerWirer"),
+      },
+      installLatestAwsSdk: false,
+    })
+
+    // AddPermission is a separate custom resource so it can be idempotent
+    // (ignore AlreadyExistsException on re-deploy).
+    const addPermission = new cr.AwsCustomResource(this, "PostConfirmationInvokePermission", {
+      role: triggerWirerRole,
+      onCreate: {
+        service:    "Lambda",
+        action:     "addPermission",
+        parameters: {
+          FunctionName: postConfirmationLambda.functionArn,
+          StatementId:  "CognitoInvokePermission",
+          Action:       "lambda:InvokeFunction",
+          Principal:    "cognito-idp.amazonaws.com",
+          SourceAccount: cdk.Stack.of(this).account,
+        },
+        physicalResourceId:    cr.PhysicalResourceId.of("PostConfirmationInvokePermission"),
+        ignoreErrorCodesMatching: "ResourceConflictException",
+      },
+      onDelete: {
+        service:    "Lambda",
+        action:     "removePermission",
+        parameters: {
+          FunctionName: postConfirmationLambda.functionArn,
+          StatementId:  "CognitoInvokePermission",
+        },
+        physicalResourceId:    cr.PhysicalResourceId.of("PostConfirmationInvokePermission"),
+        ignoreErrorCodesMatching: "ResourceNotFoundException",
+      },
+      installLatestAwsSdk: false,
+    })
+
+    // Explicit ordering: Lambda and UserPool must exist before the wirer runs.
+    triggerWirer.node.addDependency(postConfirmationLambda)
+    triggerWirer.node.addDependency(userPool)
+    addPermission.node.addDependency(postConfirmationLambda)
 
     // ── COGNITO GROUPS ────────────────────────────────────────────────────────
     //
