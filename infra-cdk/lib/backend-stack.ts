@@ -697,7 +697,7 @@ export class BackendStack extends cdk.NestedStack {
       serviceToken: pgvectorSetupLambda.functionArn,
       properties: {
         // Bump SchemaVersion to force re-run on next deploy if schema changes
-        SchemaVersion: "1",
+        SchemaVersion: "2",  // Phase 3: adds visibility_mode column + indexes
       },
     })
 
