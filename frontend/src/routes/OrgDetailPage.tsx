@@ -18,7 +18,7 @@
  *   4. Table of past invites below (consumed status, expiry)
  */
 
-import { useCallback, useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useState } from "react"
 import { useNavigate, useParams } from "react-router-dom"
 import { useAuth as useOidcAuth } from "react-oidc-context"
 import { useIsInternal } from "@/app/context/SessionContext"
