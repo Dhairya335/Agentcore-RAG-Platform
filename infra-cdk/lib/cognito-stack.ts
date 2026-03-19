@@ -87,20 +87,31 @@ export class CognitoStack extends cdk.NestedStack {
       },
       accountRecovery: cognito.AccountRecovery.EMAIL_ONLY,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
-      // NOTE: lambdaTriggers intentionally NOT set here.
-      // CDK's lambdaTriggers property auto-generates a UserPoolPostConfirmationCognito
-      // resource that creates a circular dependency:
-      //   UserPool → UserPoolPostConfirmationCognito → Lambda → UserPool
-      // Instead we wire the trigger directly on the CfnUserPool escape hatch below,
-      // which uses only the Lambda ARN (a string token) with no back-reference.
+      // NOTE: lambdaTriggers intentionally NOT set here — circular dependency.
+      // Trigger is wired via AwsCustomResource below.
+
+      // userVerification: email sent to self-registering users with their
+      // 6-digit confirmation code. Required for selfSignUpEnabled: true.
+      // Without this, Cognito Managed Login v2 throws:
+      //   "User Pool not configured properly for confirmation code delivery."
+      userVerification: {
+        emailSubject: `Your ${config.stack_name_base} verification code`,
+        emailBody:    `<p>Hello,</p>
+<p>Your verification code for <strong>${config.stack_name_base}</strong> is: <strong>{####}</strong></p>
+<p>Enter this code to complete your registration. The code expires in 24 hours.</p>
+<p>If you did not request this, you can safely ignore this email.</p>
+<p>Thanks,<br/>${config.stack_name_base} Team</p>`,
+        emailStyle:   cognito.VerificationEmailStyle.CODE,
+      },
+
+      // userInvitation: email sent to admin-created users with their temp password.
       userInvitation: {
         emailSubject: `Welcome to ${config.stack_name_base}!`,
         emailBody: `<p>Hello {username},</p>
 <p>Welcome to ${config.stack_name_base}! Your username is <strong>{username}</strong> and your temporary password is: <strong>{####}</strong></p>
 <p>Please use this temporary password to log in and set your permanent password.</p>
-<p>The CloudFront URL to your application is stored as an output in the "${config.stack_name_base}" stack, and will be printed to your terminal once the deployment process completes.</p>
 <p>Thanks,</p>
-<p>Fullstack AgentCore Solution Template Team</p>`,
+<p>${config.stack_name_base} Team</p>`,
       },
     })
 
