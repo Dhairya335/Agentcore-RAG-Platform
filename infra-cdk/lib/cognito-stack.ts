@@ -161,7 +161,7 @@ export class CognitoStack extends cdk.NestedStack {
     const triggerWirer = new cr.AwsCustomResource(this, "PostConfirmationTriggerWirer", {
       role: triggerWirerRole,
       onCreate: {
-        service:    "CognitoIdentityProvider",
+        service:    "CognitoIdentityServiceProvider",
         action:     "updateUserPool",
         parameters: {
           UserPoolId: userPool.userPoolId,
@@ -172,7 +172,7 @@ export class CognitoStack extends cdk.NestedStack {
         physicalResourceId: cr.PhysicalResourceId.of("PostConfirmationTriggerWirer"),
       },
       onUpdate: {
-        service:    "CognitoIdentityProvider",
+        service:    "CognitoIdentityServiceProvider",
         action:     "updateUserPool",
         parameters: {
           UserPoolId: userPool.userPoolId,
@@ -183,7 +183,7 @@ export class CognitoStack extends cdk.NestedStack {
         physicalResourceId: cr.PhysicalResourceId.of("PostConfirmationTriggerWirer"),
       },
       onDelete: {
-        service:    "CognitoIdentityProvider",
+        service:    "CognitoIdentityServiceProvider",
         action:     "updateUserPool",
         parameters: {
           UserPoolId:   userPool.userPoolId,
