@@ -84,21 +84,15 @@ def handler(event, context):
         body = event  # direct invocation (CLI test)
 
     query     = body.get("query", "").strip()
-    tenant_id = body.get("tenantId", "").strip()
+    tenant_id = body.get("tenantId", "").strip()   # = org_id (Phase 4)
+    user_id   = body.get("userId", "").strip()      # Cognito sub — for OWNER_ONLY filter
     top_k     = min(int(body.get("topK", TOP_K_DEFAULT)), TOP_K_MAX)
 
     # Phase 3.4 — scoped retrieval
-    # docIds: list of specific document UUIDs to restrict search to.
-    # collectionId: if provided, Lambda resolves member docIds from DynamoDB,
-    #               then applies the same docIds restriction.
-    # Both are optional — absence means "search all tenant documents" (current behaviour).
-    doc_ids      = body.get("docIds")       # list[str] or None
-    collection_id = body.get("collectionId") # str or None
+    doc_ids       = body.get("docIds")
+    collection_id = body.get("collectionId")
 
-    # Phase 3 RBAC: role passed by the agent from JWT claims.
-    # The agent extracts role using utils/role.py and forwards it as a tool parameter.
-    # INTERNAL → can retrieve both INTERNAL_ONLY and EXTERNAL_ALLOWED chunks.
-    # EXTERNAL → can only retrieve EXTERNAL_ALLOWED chunks.
+    # Phase 3 RBAC: role passed by agent from JWT claims.
     # Default to EXTERNAL (fail-safe) if not provided.
     user_role = body.get("userRole", "EXTERNAL").strip().upper()
     if user_role not in ("INTERNAL", "EXTERNAL"):
@@ -109,10 +103,18 @@ def handler(event, context):
     if not tenant_id:
         return _response(400, {"error": "tenantId is required"})
 
-    print(f"[RAG] query='{query[:80]}' tenant={tenant_id} topK={top_k} role={user_role} scope=docIds:{doc_ids} col:{collection_id}")
+    print(
+        f"[RAG] query='{query[:80]}' org={tenant_id} user={user_id or 'n/a'} "
+        f"topK={top_k} role={user_role} scope=docIds:{doc_ids} col:{collection_id}"
+    )
 
     try:
-        result = retrieve(query, tenant_id, top_k, user_role, doc_ids=doc_ids, collection_id=collection_id)
+        result = retrieve(
+            query, tenant_id, top_k, user_role,
+            user_id=user_id,
+            doc_ids=doc_ids,
+            collection_id=collection_id,
+        )
         return _response(200, result)
     except Exception as e:
         print(f"[RAG ERROR] {e}")
@@ -134,9 +136,10 @@ VISIBILITY_BY_ROLE = {
 
 def retrieve(
     query:         str,
-    tenant_id:     str,
+    tenant_id:     str,    # = org_id (Phase 4)
     top_k:         int,
     user_role:     str = "EXTERNAL",
+    user_id:       str = "",
     doc_ids:       list | None = None,
     collection_id: str | None = None,
 ) -> dict:
@@ -145,45 +148,39 @@ def retrieve(
 
     Args:
         query:     The user's question text.
-        tenant_id: Cognito sub claim — scopes retrieval to this user's documents.
+        tenant_id: org_id — scopes retrieval to this organisation's documents.
         top_k:     Maximum number of chunks to return (capped at TOP_K_MAX=8).
         user_role: "INTERNAL" or "EXTERNAL" — controls visibility_mode filter.
-                   INTERNAL → retrieves INTERNAL_ONLY + EXTERNAL_ALLOWED chunks.
-                   EXTERNAL → retrieves EXTERNAL_ALLOWED chunks only.
+        user_id:   Cognito sub — used to include OWNER_ONLY chunks owned by this user.
 
     Returns:
         {
-            "context_block": str,   # formatted context for agent prompt
-            "chunks_found":  int,   # number of chunks after filtering
-            "query":         str,   # echo of original query
+            "context_block": str,
+            "chunks_found":  int,
+            "query":         str,
         }
     """
     # Resolve allowed visibility modes for this role
     allowed_visibility = VISIBILITY_BY_ROLE.get(user_role, VISIBILITY_BY_ROLE["EXTERNAL"])
 
     # Phase 3.4 — resolve scoped doc_ids
-    # collectionId takes precedence: resolve membership from DynamoDB, union with any
-    # explicit docIds. Result is a de-duped set; empty set means no restriction.
     resolved_doc_ids: list[str] = []
     if collection_id and DOCS_TABLE_NAME:
         resolved_doc_ids = _resolve_collection_members(tenant_id, collection_id)
         print(f"[RAG] collection {collection_id} resolved to {len(resolved_doc_ids)} docs")
     if doc_ids:
-        # Union: set guarantees no duplicates, list preserves determinism
         merged = set(resolved_doc_ids) | set(doc_ids)
         resolved_doc_ids = list(merged)
 
     # Step 1 — Embed the query
-    # Uses the same model + settings as ingestion-worker to ensure
-    # vectors are comparable (same space, same normalisation).
     query_vector = _embed_text(query)
 
-    # Step 2 — Two-stage vector retrieval
-    # Fetch topK*2 candidates from Aurora (HNSW approximate search),
-    # then filter in Lambda to topK by similarity threshold.
-    # This improves precision without a second DB round-trip.
+    # Step 2 — Two-stage vector retrieval with org-level + sharing_scope filter
     fetch_limit = top_k * 2
-    raw_chunks  = _vector_search(query_vector, tenant_id, fetch_limit, allowed_visibility, resolved_doc_ids)
+    raw_chunks  = _vector_search(
+        query_vector, tenant_id, fetch_limit, allowed_visibility,
+        resolved_doc_ids, user_id=user_id,
+    )
 
     # Step 3 — Similarity threshold filter
     # cosine similarity = 1 - cosine_distance
@@ -195,11 +192,12 @@ def retrieve(
 
     print(
         f"[RAG] fetched={len(raw_chunks)} after_filter={len(filtered)} "
-        f"returned={len(final_chunks)} threshold={SIMILARITY_CUTOFF}"
+        f"returned={len(final_chunks)} threshold={SIMILARITY_CUTOFF} "
+        f"org={tenant_id} user={user_id or 'n/a'} role={user_role}"
     )
 
     if not final_chunks:
-        print("[RAG] No relevant chunks found above threshold")
+        print(f"[RAG] No relevant chunks found above threshold for org={tenant_id}")
         return {
             "context_block": "",
             "chunks_found":  0,
@@ -268,47 +266,49 @@ def _embed_text(text: str) -> list[float]:
 
 def _vector_search(
     query_vector:       list[float],
-    tenant_id:          str,
+    tenant_id:          str,           # = org_id (Phase 4)
     fetch_limit:        int,
     allowed_visibility: tuple[str, ...] = ("EXTERNAL_ALLOWED",),
     doc_ids:            list[str] | None = None,
+    user_id:            str = "",
 ) -> list[dict]:
     """
     Cosine similarity search using pgvector HNSW index.
 
-    SQL notes:
-      - `embedding <=> :query_vec::vector` = cosine DISTANCE (0 = identical, 2 = opposite)
-      - `1 - (embedding <=> ...)` = cosine SIMILARITY (1 = identical, -1 = opposite)
-      - WHERE tenant_id = :tenant_id enforces multi-tenant isolation at the DB level
-      - WHERE visibility_mode = ANY(...) enforces RBAC at the DB level (Phase 3)
-        INTERNAL users see: INTERNAL_ONLY + EXTERNAL_ALLOWED
-        EXTERNAL users see: EXTERNAL_ALLOWED only
-        This is enforced in SQL — not just hidden in UI — so even a crafted tool
-        call cannot bypass the restriction.
-      - ORDER BY distance ASC (closest first) + LIMIT = top-K approximate neighbours
-      - The HNSW index on (embedding vector_cosine_ops) is used automatically
+    Phase 4 sharing_scope filter:
+      For each chunk to be eligible, one of the following must be true:
+        (a) sharing_scope = 'ORG_SHARED'     — visible to any active org member
+        (b) owner_user_id = :user_id         — user owns this OWNER_ONLY chunk
 
-    We do NOT use OFFSET or pagination — retrieval is always a fresh top-K query.
+      SQL condition: (sharing_scope = 'ORG_SHARED' OR owner_user_id = :user_id)
+
+    Combined with:
+      - tenant_id = :org_id                  — org isolation
+      - visibility_mode IN (...)             — role-class RBAC (INTERNAL/EXTERNAL)
+
+    All enforcement is in SQL — not just in UI — so crafted tool calls cannot bypass.
     """
     db_cluster_arn = _get_ssm("aurora-cluster-arn")
     db_secret_arn  = _get_ssm("aurora-secret-arn")
     db_name        = _get_ssm("aurora-db-name")
 
-    # Serialise vector as PostgreSQL literal: [v1,v2,...,v1024]
     vector_literal = "[" + ",".join(f"{v:.8f}" for v in query_vector) + "]"
 
-    # Build visibility IN clause — parameterised to prevent injection.
-    # RDS Data API does not support array parameters directly, so we build
-    # individual named params: :vis_0, :vis_1, etc.
     vis_params = [f":vis_{i}" for i in range(len(allowed_visibility))]
     vis_clause = ", ".join(vis_params)
 
-    # Phase 3.4 — optional doc_id scope clause
-    # Only added when doc_ids is a non-empty list. Same per-param pattern as visibility.
     doc_clause = ""
     if doc_ids:
         doc_params_names = [f":doc_{i}" for i in range(len(doc_ids))]
         doc_clause = f"AND doc_id IN ({', '.join(doc_params_names)})"
+
+    # Phase 4: sharing_scope filter.
+    # If user_id is provided, include OWNER_ONLY chunks they own.
+    # If user_id is empty (shouldn't happen in production), only ORG_SHARED.
+    if user_id:
+        scope_clause = "(sharing_scope = 'ORG_SHARED' OR owner_user_id = :user_id)"
+    else:
+        scope_clause = "sharing_scope = 'ORG_SHARED'"
 
     sql = f"""
         SELECT
@@ -321,10 +321,13 @@ def _vector_search(
             section_title,
             source_type,
             visibility_mode,
+            sharing_scope,
+            owner_user_id,
             1 - (embedding <=> :query_vec::vector) AS similarity
         FROM  fast_chunks
         WHERE tenant_id      = :tenant_id
           AND visibility_mode IN ({vis_clause})
+          AND {scope_clause}
           {doc_clause}
         ORDER BY embedding <=> :query_vec::vector
         LIMIT :fetch_limit
@@ -337,6 +340,8 @@ def _vector_search(
     ]
     for i, vis in enumerate(allowed_visibility):
         params.append({"name": f"vis_{i}", "value": {"stringValue": vis}})
+    if user_id:
+        params.append({"name": "user_id", "value": {"stringValue": user_id}})
     if doc_ids:
         for i, did in enumerate(doc_ids):
             params.append({"name": f"doc_{i}", "value": {"stringValue": did}})

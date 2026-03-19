@@ -95,18 +95,49 @@ SCHEMA_STATEMENTS = [
     """,
 
     # 5. Supporting indexes for hybrid search filters
-    # These let the query planner do: vector similarity + WHERE tenant_id = X
-    # which is the core RAG retrieval pattern.
     "CREATE INDEX IF NOT EXISTS fast_chunks_tenant_idx        ON fast_chunks (tenant_id)",
     "CREATE INDEX IF NOT EXISTS fast_chunks_doc_idx           ON fast_chunks (doc_id)",
     "CREATE INDEX IF NOT EXISTS fast_chunks_source_idx        ON fast_chunks (source_type)",
     "CREATE INDEX IF NOT EXISTS fast_chunks_tenant_doc_idx    ON fast_chunks (tenant_id, doc_id)",
 
-    # 6. Index on visibility_mode for fast retrieval filtering (Phase 3 RBAC).
-    # Used in the WHERE clause: visibility_mode = ANY(:allowed_visibility)
-    # Combined with tenant_id filter for the full retrieval query.
+    # 6. Phase 3 RBAC visibility index
     "CREATE INDEX IF NOT EXISTS fast_chunks_visibility_idx    ON fast_chunks (visibility_mode)",
     "CREATE INDEX IF NOT EXISTS fast_chunks_tenant_vis_idx    ON fast_chunks (tenant_id, visibility_mode)",
+
+    # 7. Phase 4 org-level tenancy: add owner_user_id and sharing_scope columns.
+    # ADD COLUMN IF NOT EXISTS is idempotent — safe on both fresh and existing clusters.
+    # owner_user_id: Cognito sub of the document uploader
+    # sharing_scope: ORG_SHARED (all org members can retrieve) | OWNER_ONLY (uploader only)
+    """
+    ALTER TABLE fast_chunks
+    ADD COLUMN IF NOT EXISTS owner_user_id TEXT
+    """,
+
+    """
+    ALTER TABLE fast_chunks
+    ADD COLUMN IF NOT EXISTS sharing_scope TEXT NOT NULL DEFAULT 'ORG_SHARED'
+    """,
+
+    # 8. Constraint on sharing_scope to prevent invalid values
+    # DO blocks are idempotent — safe to re-run
+    """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conname = 'fast_chunks_sharing_scope_chk'
+        ) THEN
+            ALTER TABLE fast_chunks
+            ADD CONSTRAINT fast_chunks_sharing_scope_chk
+            CHECK (sharing_scope IN ('ORG_SHARED', 'OWNER_ONLY'));
+        END IF;
+    END;
+    $$
+    """,
+
+    # 9. Composite index for the Phase 4 sharing_scope + owner query pattern:
+    #    WHERE tenant_id = :org_id AND (sharing_scope = 'ORG_SHARED' OR owner_user_id = :user_id)
+    "CREATE INDEX IF NOT EXISTS fast_chunks_tenant_scope_owner_idx ON fast_chunks (tenant_id, sharing_scope, owner_user_id)",
 ]
 
 

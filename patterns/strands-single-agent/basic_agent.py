@@ -15,6 +15,7 @@ from strands.tools.mcp import MCPClient
 from strands_code_interpreter import StrandsCodeInterpreterTools
 
 from utils.auth import extract_user_id_from_context, get_gateway_access_token
+from utils.principal import resolve_principal_from_context, MembershipError
 from utils.role import get_user_role_from_context
 from utils.ssm import get_ssm_parameter
 
@@ -55,34 +56,43 @@ def create_gateway_mcp_client(access_token: str) -> MCPClient:
     return gateway_client
 
 
-def create_basic_agent(user_id: str, session_id: str, user_role: str = "EXTERNAL") -> Agent:
+def create_basic_agent(
+    user_id: str,
+    session_id: str,
+    user_role: str = "EXTERNAL",
+    org_id: str = "",
+) -> Agent:
     """
     Create a basic agent with Gateway MCP tools and memory integration.
 
-    This function sets up an agent that can access tools through the AgentCore Gateway
-    and maintains conversation memory. It handles authentication, creates the MCP client
-    connection, and configures the agent with access to all tools available through
-    the Gateway. If Gateway connection fails, it falls back to an agent without tools.
-
     Args:
-        user_id:   Cognito sub claim — used as tenantId for document scoping.
+        user_id:   Cognito sub claim — immutable user identity.
         session_id: Runtime session ID for memory continuity.
-        user_role: "INTERNAL" or "EXTERNAL" — controls document access and citation format.
-                   INTERNAL: full document library access, full citations with docId.
-                   EXTERNAL: restricted to EXTERNAL_ALLOWED content, masked citations.
+        user_role: "INTERNAL" or "EXTERNAL" — controls citation format.
+        org_id:    Organisation ID — tenantId for all RAG retrieve calls.
+                   MUST be org_id, not user_id (Phase 4 org-level tenancy).
     """
+    # tenantId passed to tools is org_id (not user sub)
+    tenant_id = org_id if org_id else user_id  # fallback for safety
+
     # Role-aware citation format instruction
     if user_role == "INTERNAL":
         citation_format_instruction = """CITATION FORMAT (use exactly — internal user, full citations):
   [Source: <file_name>, docId:<doc_id>, page <page_number>, chunk <X>/<Y>]
   Example: "The encoder maps input to a continuous representation [Source: attention-paper.pdf, docId:abc-123, page 3, chunk 2/8]."
   The docId field enables the Source Viewer. Always include it when present in the retrieved context."""
-        retrieval_role_instruction = f"""Always pass tenantId="{user_id}" and userRole="INTERNAL" when calling rag_retrieve_documents."""
+        retrieval_role_instruction = (
+            f'Always pass tenantId="{tenant_id}", userId="{user_id}", '
+            f'and userRole="INTERNAL" when calling rag_retrieve_documents.'
+        )
     else:
         citation_format_instruction = """CITATION FORMAT (use exactly — external user, masked citations):
   Answer the question based on the retrieved knowledge. Do not expose document names, file structures, or knowledge base organization.
   When asked for sources, you may say "Based on our knowledge base" without revealing specific document details."""
-        retrieval_role_instruction = f"""Always pass tenantId="{user_id}" and userRole="EXTERNAL" when calling rag_retrieve_documents."""
+        retrieval_role_instruction = (
+            f'Always pass tenantId="{tenant_id}", userId="{user_id}", '
+            f'and userRole="EXTERNAL" when calling rag_retrieve_documents.'
+        )
 
     system_prompt = f"""You are a helpful assistant with access to the user's uploaded documents and a Code Interpreter.
 
@@ -148,8 +158,9 @@ GENERAL BEHAVIOUR:
             model=bedrock_model,
             session_manager=session_manager,
             trace_attributes={
-                "user.id":   user_id,
-                "user.role": user_role,
+                "user.id":    user_id,
+                "user.org":   org_id if org_id else tenant_id,
+                "user.role":  user_role,
                 "session.id": session_id,
             },
         )
@@ -197,21 +208,32 @@ async def agent_stream(payload, context: RequestContext):
         return
 
     try:
-        # Extract user ID securely from the validated JWT token
-        # instead of trusting the payload body (which could be manipulated)
-        user_id = extract_user_id_from_context(context)
-
-        # Extract role from Cognito groups in JWT — drives access control
-        # throughout the entire request (retrieval visibility + citation format)
-        user_role = get_user_role_from_context(context)
+        # Resolve principal — extracts user_id, org_id, role_class from JWT + membership table
+        # org_id is the authoritative tenant identifier for all RAG retrieve calls
+        try:
+            principal = resolve_principal_from_context(context)
+            user_id   = principal.user_id
+            org_id    = principal.org_id
+            user_role = principal.role_class
+        except MembershipError as me:
+            # User has no active org membership — cannot proceed
+            print(f"[STREAM] Membership resolution failed: {me}")
+            yield {"status": "error", "error": "Your account is not yet configured for access. Please complete registration or contact your administrator."}
+            return
+        except Exception:
+            # Fall back to JWT-only extraction for backward compat during migration
+            user_id   = extract_user_id_from_context(context)
+            org_id    = user_id   # pre-Phase-4 fallback: user sub as tenant
+            user_role = get_user_role_from_context(context)
+            print(f"[STREAM][WARN] Principal resolution failed, using JWT fallback user={user_id}")
 
         print(
-            f"[STREAM] Starting streaming invocation for user: {user_id}, "
-            f"role: {user_role}, session: {session_id}"
+            f"[STREAM] Starting invocation: user={user_id} org={org_id} "
+            f"role={user_role} session={session_id}"
         )
         print(f"[STREAM] Query: {user_query}")
 
-        agent = create_basic_agent(user_id, session_id, user_role)
+        agent = create_basic_agent(user_id, session_id, user_role, org_id=org_id)
 
         # Use the agent's stream_async method for true token-level streaming
         async for event in agent.stream_async(user_query):

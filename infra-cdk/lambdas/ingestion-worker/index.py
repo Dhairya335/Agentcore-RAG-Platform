@@ -130,15 +130,50 @@ def process_sqs_record(record: dict):
 def process_document(bucket: str, key: str):
     head      = s3.head_object(Bucket=bucket, Key=key)
     obj_meta  = head.get("Metadata", {})
-    tenant_id = obj_meta.get("tenant-id")
+
+    # Phase 4: org-level tenancy.
+    # S3 metadata now carries org-id (set by presign-upload Lambda).
+    # We prefer the authoritative DynamoDB doc record, but fall back to S3 metadata
+    # for backward compatibility with pre-Phase-4 uploads (which stored user sub
+    # as tenant-id).  For new uploads, org-id is always present.
+    org_id    = obj_meta.get("org-id")       # new field — org-level tenant id
     doc_id    = obj_meta.get("doc-id")
     version   = int(obj_meta.get("version", "1"))
     file_name = key.split("/")[-1]
 
-    if not tenant_id or not doc_id:
-        raise ValueError(f"Missing S3 metadata (tenant-id, doc-id) on key: {key}")
+    # Fallback: pre-Phase-4 uploads stored "tenant-id" = user sub.
+    # If org-id is absent, fall back to tenant-id for backward compat.
+    if not org_id:
+        org_id = obj_meta.get("tenant-id")
 
-    print(f"[INGEST] tenant={tenant_id} doc={doc_id} v={version} file={file_name}")
+    if not org_id or not doc_id:
+        raise ValueError(f"Missing S3 metadata (org-id/tenant-id, doc-id) on key: {key}")
+
+    # Load authoritative document metadata from DynamoDB to get sharing_scope
+    # and owner_user_id.  S3 metadata is a convenience cache — DynamoDB is truth.
+    owner_user_id = obj_meta.get("owner-user-id", "")
+    sharing_scope  = obj_meta.get("sharing-scope", "ORG_SHARED").upper()
+    if sharing_scope not in ("ORG_SHARED", "OWNER_ONLY"):
+        sharing_scope = "ORG_SHARED"
+
+    # Attempt to read authoritative values from DynamoDB (fail open to S3 metadata)
+    try:
+        doc_meta = _load_doc_metadata(org_id, doc_id, version)
+        if doc_meta:
+            owner_user_id = doc_meta.get("ownerUserId", owner_user_id)
+            sharing_scope  = doc_meta.get("sharingScope", sharing_scope).upper()
+            if sharing_scope not in ("ORG_SHARED", "OWNER_ONLY"):
+                sharing_scope = "ORG_SHARED"
+    except Exception as e:
+        print(f"[INGEST][WARN] Could not load DynamoDB doc metadata, using S3 values: {e}")
+
+    # tenant_id column in Aurora stores org_id (Phase 4 semantic change)
+    tenant_id = org_id
+
+    print(
+        f"[INGEST] org={org_id} doc={doc_id} v={version} file={file_name} "
+        f"owner={owner_user_id} sharing={sharing_scope}"
+    )
 
     db_cluster_arn = get_ssm("aurora-cluster-arn")
     db_secret_arn  = get_ssm("aurora-secret-arn")
@@ -162,14 +197,17 @@ def process_document(bucket: str, key: str):
         embedded = _embed_parallel(chunks)
 
         # Single-batch Aurora insert
+        # tenant_id = org_id (Phase 4 semantic change — org-level tenancy)
         batch_insert_chunks(
             db_cluster_arn, db_secret_arn, db_name,
             tenant_id, doc_id, key, file_name, ext,
             embedded, chunk_total,
+            owner_user_id=owner_user_id,
+            sharing_scope=sharing_scope,
         )
 
         update_doc_status(tenant_id, doc_id, version, "READY", chunk_total=chunk_total)
-        print(f"[INGEST] Done — {chunk_total} chunks stored for doc {doc_id}")
+        print(f"[INGEST] indexed docId={doc_id} org={org_id} chunks={chunk_total}")
 
     except Exception as e:
         print(f"[INGEST ERROR] {e}")
@@ -580,20 +618,43 @@ def embed_text(text: str) -> list[float]:
     return json.loads(response["body"].read())["embedding"]
 
 
+# DynamoDB doc metadata loader
+
+def _load_doc_metadata(org_id: str, doc_id: str, version: int) -> dict | None:
+    """
+    Load the VER record from DynamoDB for the authoritative owner_user_id
+    and sharing_scope values.  Falls back to S3 metadata values if this fails.
+    """
+    pk = f"TENANT#{org_id}#DOC#{doc_id}"
+    sk = f"VER#{version:06d}"
+    resp = dynamodb.get_item(
+        TableName=DOCS_TABLE_NAME,
+        Key={"PK": {"S": pk}, "SK": {"S": sk}},
+        ConsistentRead=True,
+    )
+    item = resp.get("Item")
+    if not item:
+        return None
+    # Flatten DynamoDB typed format to plain dict
+    return {k: list(v.values())[0] for k, v in item.items()}
+
+
 # Aurora — batch INSERT via RDS Data API
 
 def batch_insert_chunks(
     db_cluster_arn:  str,
     db_secret_arn:   str,
     db_name:         str,
-    tenant_id:       str,
+    tenant_id:       str,   # = org_id (Phase 4 semantic change)
     doc_id:          str,
     s3_key:          str,
     file_name:       str,
     source_type:     str,
     embedded:        list[EmbeddedChunk],
     chunk_total:     int,
-    visibility_mode: str = "INTERNAL_ONLY",
+    owner_user_id:   str = "",
+    sharing_scope:   str = "ORG_SHARED",
+    visibility_mode: str = "EXTERNAL_ALLOWED",
 ):
     """
     Insert all chunks for a document in a single batch_execute_statement call.
@@ -607,22 +668,24 @@ def batch_insert_chunks(
     need the generated UUIDs — id is DEFAULT gen_random_uuid().
 
     visibility_mode (Phase 3 RBAC):
-      - 'INTERNAL_ONLY'    — only INTERNAL role users can retrieve these chunks (default)
-      - 'EXTERNAL_ALLOWED' — both INTERNAL and EXTERNAL role users can retrieve
-      At ingest time, all chunks default to INTERNAL_ONLY. The visibility can be
-      changed later at the document or collection level via the management API.
+      - 'EXTERNAL_ALLOWED' — both INTERNAL and EXTERNAL users can retrieve (default)
+      - 'INTERNAL_ONLY'    — only INTERNAL role users can retrieve these chunks
+      Default is EXTERNAL_ALLOWED so all uploaded documents are immediately
+      queryable by both user roles without extra configuration.
     """
     sql = """
         INSERT INTO fast_chunks (
             tenant_id, doc_id, s3_key, file_name, source_type,
             chunk_index, chunk_total, content, embedding,
             page_number, section_title, heading_level,
-            sheet_name, row_start, row_end, visibility_mode
+            sheet_name, row_start, row_end,
+            visibility_mode, owner_user_id, sharing_scope
         ) VALUES (
             :tenant_id, :doc_id, :s3_key, :file_name, :source_type,
             :chunk_index, :chunk_total, :content, :embedding::vector,
             :page_number, :section_title, :heading_level,
-            :sheet_name, :row_start, :row_end, :visibility_mode
+            :sheet_name, :row_start, :row_end,
+            :visibility_mode, :owner_user_id, :sharing_scope
         )
     """
 
@@ -637,22 +700,24 @@ def batch_insert_chunks(
         c              = ec.chunk
         vector_literal = "[" + ",".join(f"{v:.8f}" for v in ec.embedding) + "]"
         param_sets.append([
-            _str("tenant_id",       tenant_id),
-            _str("doc_id",          doc_id),
-            _str("s3_key",          s3_key),
-            _str("file_name",       file_name),
-            _str("source_type",     source_type),
-            _int("chunk_index",     c.chunk_index),
-            _int("chunk_total",     chunk_total),
-            _str("content",         _sanitise_text(c.content)),
-            _str("embedding",       vector_literal),
-            _int("page_number",     c.page_number),
-            _str("section_title",   c.section_title),
-            _int("heading_level",   c.heading_level),
-            _str("sheet_name",      c.sheet_name),
-            _int("row_start",       c.row_start),
-            _int("row_end",         c.row_end),
+            _str("tenant_id",      tenant_id),       # = org_id (Phase 4)
+            _str("doc_id",         doc_id),
+            _str("s3_key",         s3_key),
+            _str("file_name",      file_name),
+            _str("source_type",    source_type),
+            _int("chunk_index",    c.chunk_index),
+            _int("chunk_total",    chunk_total),
+            _str("content",        _sanitise_text(c.content)),
+            _str("embedding",      vector_literal),
+            _int("page_number",    c.page_number),
+            _str("section_title",  c.section_title),
+            _int("heading_level",  c.heading_level),
+            _str("sheet_name",     c.sheet_name),
+            _int("row_start",      c.row_start),
+            _int("row_end",        c.row_end),
             _str("visibility_mode", visibility_mode),
+            _str("owner_user_id",  owner_user_id or None),
+            _str("sharing_scope",  sharing_scope),
         ])
 
     rds_data.batch_execute_statement(

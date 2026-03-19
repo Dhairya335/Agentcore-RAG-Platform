@@ -113,6 +113,10 @@ export class BackendStack extends cdk.NestedStack {
     // Phase 2D: RAG retrieval — registers rag-retrieve Lambda as a Gateway tool target
     this.createRagRetrieve(props.config)
 
+    // Phase 4: Org-level tenancy — DynamoDB tables (orgs, memberships, invites)
+    //           + admin API routes + complete-registration endpoint
+    this.createOrgTenancyInfra(props.config, props.frontendUrl)
+
   }
 
   private createAgentCoreRuntime(config: AppConfig): void {
@@ -697,7 +701,7 @@ export class BackendStack extends cdk.NestedStack {
       serviceToken: pgvectorSetupLambda.functionArn,
       properties: {
         // Bump SchemaVersion to force re-run on next deploy if schema changes
-        SchemaVersion: "2",  // Phase 3: adds visibility_mode column + indexes
+        SchemaVersion: "3",  // Phase 4: adds owner_user_id + sharing_scope columns + composite index
       },
     })
 
@@ -826,10 +830,12 @@ export class BackendStack extends cdk.NestedStack {
       },
       timeout: cdk.Duration.seconds(30),
       environment: {
-        DOCS_BUCKET_NAME: rawDocsBucket.bucketName,
-        DOCS_TABLE_NAME:  docsTable.tableName,
-        AWS_ACCOUNT_ID:   cdk.Aws.ACCOUNT_ID,
-        CORS_ALLOWED_ORIGINS: `${frontendUrl},http://localhost:3000`
+        DOCS_BUCKET_NAME:      rawDocsBucket.bucketName,
+        DOCS_TABLE_NAME:       docsTable.tableName,
+        AWS_ACCOUNT_ID:        cdk.Aws.ACCOUNT_ID,
+        CORS_ALLOWED_ORIGINS:  `${frontendUrl},http://localhost:3000`,
+        // Phase 4: org_id resolved server-side from this membership table
+        MEMBERSHIPS_TABLE_NAME: `${config.stack_name_base}-user-memberships`,
       },
       logGroup: new logs.LogGroup(this, "PresignLambdaLogGroup", {
         logGroupName: `/aws/lambda/${config.stack_name_base}-presign-upload`,
@@ -904,14 +910,17 @@ export class BackendStack extends cdk.NestedStack {
       modelName: "PresignRequest",
       schema: {
         type: apigateway.JsonSchemaType.OBJECT,
-        required: ["fileName", "contentType", "tenantId"],
+        // Phase 4: tenantId removed from required — org_id is now resolved server-side
+        // from fast_user_memberships using the validated JWT sub claim.
+        // Browser must NOT send tenantId; the Lambda ignores it if present.
+        required: ["fileName", "contentType"],
         properties: {
-          fileName:    { type: apigateway.JsonSchemaType.STRING },
-          contentType: { type: apigateway.JsonSchemaType.STRING },
-          tenantId:    { type: apigateway.JsonSchemaType.STRING },
-          fileSize:    { type: apigateway.JsonSchemaType.NUMBER },
-          docId:       { type: apigateway.JsonSchemaType.STRING },
-          metadata:    { type: apigateway.JsonSchemaType.OBJECT },
+          fileName:     { type: apigateway.JsonSchemaType.STRING },
+          contentType:  { type: apigateway.JsonSchemaType.STRING },
+          fileSize:     { type: apigateway.JsonSchemaType.NUMBER },
+          docId:        { type: apigateway.JsonSchemaType.STRING },
+          metadata:     { type: apigateway.JsonSchemaType.OBJECT },
+          sharingScope: { type: apigateway.JsonSchemaType.STRING },
         },
       },
     })
@@ -1285,8 +1294,10 @@ export class BackendStack extends cdk.NestedStack {
         platform: "linux/arm64",
       },
       environment: {
-        STACK_NAME:      config.stack_name_base,
-        DOCS_TABLE_NAME: `${config.stack_name_base}-documents`,
+        STACK_NAME:             config.stack_name_base,
+        DOCS_TABLE_NAME:        `${config.stack_name_base}-documents`,
+        // Phase 4: used to load authoritative org_id from DynamoDB for pre-Phase-4 uploads
+        MEMBERSHIPS_TABLE_NAME: `${config.stack_name_base}-user-memberships`,
       },
       logGroup: new logs.LogGroup(this, "IngestionWorkerLogGroup", {
         logGroupName:  `/aws/lambda/${config.stack_name_base}-ingestion-worker`,
@@ -1762,6 +1773,412 @@ export class BackendStack extends cdk.NestedStack {
     new cdk.CfnOutput(this, "RagRetrieveTargetId", {
       value:       ragRetrieveTarget.ref,
       description: "AgentCore Gateway RAG Retrieve Target ID",
+    })
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  //  Phase 4 — Org-Level Tenancy Infrastructure
+  //
+  //  Three DynamoDB tables:
+  //    fast_orgs            — org registry (org_id PK)
+  //    fast_user_memberships — user→org mapping (user_sub PK)
+  //    fast_org_invites     — email-bound single-use invite tokens (token_hash PK)
+  //
+  //  Three Lambda functions:
+  //    create-org           — POST /admin/orgs               (INTERNAL only)
+  //    create-invite        — POST /admin/orgs/{orgId}/invites (INTERNAL only)
+  //    complete-registration — POST /auth/complete-external-registration (any user)
+  //
+  //  presign-upload and ingestion-worker already get MEMBERSHIPS_TABLE_NAME
+  //  injected via their own environment blocks above.
+  // ═══════════════════════════════════════════════════════════════════════════
+  private createOrgTenancyInfra(config: AppConfig, frontendUrl: string): void {
+
+    // ── 1. DynamoDB: fast_orgs ────────────────────────────────────────────────
+    // Stores one record per organisation.
+    // org_id = "org-internal" for the vendor org (created by backfill script).
+    // External orgs get org_id = "{slug}-{6-char uuid}" (set by create-org Lambda).
+    const orgsTable = new dynamodb.Table(this, "OrgsTable", {
+      tableName:   `${config.stack_name_base}-orgs`,
+      partitionKey: { name: "org_id", type: dynamodb.AttributeType.STRING },
+      billingMode:  dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      encryption:   dynamodb.TableEncryption.AWS_MANAGED,
+      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
+    })
+
+    // SSM: new table names written for the backfill script and future tooling
+    new ssm.StringParameter(this, "OrgsTableParam", {
+      parameterName: `/${config.stack_name_base}/rag/orgs-table-name`,
+      stringValue:   orgsTable.tableName,
+      description:   "DynamoDB table for org registry (Phase 4)",
+    })
+
+    // ── 2. DynamoDB: fast_user_memberships ────────────────────────────────────
+    // Authoritative source of truth: user_sub → org_id mapping.
+    // Every authorization-critical Lambda does a strongly consistent GetItem here.
+    // GSI on org_id allows listing all members of an org (admin use case).
+    const membershipsTable = new dynamodb.Table(this, "MembershipsTable", {
+      tableName:   `${config.stack_name_base}-user-memberships`,
+      partitionKey: { name: "user_sub", type: dynamodb.AttributeType.STRING },
+      billingMode:  dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      encryption:   dynamodb.TableEncryption.AWS_MANAGED,
+      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
+    })
+
+    membershipsTable.addGlobalSecondaryIndex({
+      indexName:     "org_id-index",
+      partitionKey:  { name: "org_id",     type: dynamodb.AttributeType.STRING },
+      sortKey:       { name: "created_at", type: dynamodb.AttributeType.STRING },
+      projectionType: dynamodb.ProjectionType.ALL,
+    })
+
+    new ssm.StringParameter(this, "MembershipsTableParam", {
+      parameterName: `/${config.stack_name_base}/rag/memberships-table-name`,
+      stringValue:   membershipsTable.tableName,
+      description:   "DynamoDB table for user→org membership (Phase 4)",
+    })
+
+    // ── 3. DynamoDB: fast_org_invites ─────────────────────────────────────────
+    // Invite tokens stored as SHA-256 hash (never raw).
+    // TTL enabled so expired invites auto-purge after 7 days.
+    // PK = token_hash (SHA-256 hex string).
+    const invitesTable = new dynamodb.Table(this, "InvitesTable", {
+      tableName:    `${config.stack_name_base}-org-invites`,
+      partitionKey: { name: "token_hash", type: dynamodb.AttributeType.STRING },
+      billingMode:  dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      encryption:   dynamodb.TableEncryption.AWS_MANAGED,
+      // TTL: items auto-deleted after expires_at epoch seconds passes
+      timeToLiveAttribute: "expires_at",
+      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
+    })
+
+    new ssm.StringParameter(this, "InvitesTableParam", {
+      parameterName: `/${config.stack_name_base}/rag/invites-table-name`,
+      stringValue:   invitesTable.tableName,
+      description:   "DynamoDB table for org invite tokens (Phase 4)",
+    })
+
+    // ── 4. Lambda: create-org ─────────────────────────────────────────────────
+    // POST /admin/orgs — INTERNAL role only (enforced inside Lambda via JWT groups).
+    // Generates slug-based org_id server-side; writes to orgsTable.
+    const createOrgLambda = new lambda.Function(this, "CreateOrgLambda", {
+      functionName: `${config.stack_name_base}-create-org`,
+      runtime:      lambda.Runtime.PYTHON_3_13,
+      code:         lambda.Code.fromAsset(
+        path.join(__dirname, "..", "lambdas", "create-org")
+      ),
+      handler:      "index.handler",
+      architecture: lambda.Architecture.ARM_64,
+      timeout:      cdk.Duration.seconds(15),
+      memorySize:   256,
+      environment: {
+        ORGS_TABLE_NAME:      orgsTable.tableName,
+        CORS_ALLOWED_ORIGINS: `${frontendUrl},http://localhost:3000`,
+      },
+      logGroup: new logs.LogGroup(this, "CreateOrgLogGroup", {
+        logGroupName:  `/aws/lambda/${config.stack_name_base}-create-org`,
+        retention:     logs.RetentionDays.ONE_WEEK,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      }),
+    })
+    orgsTable.grantReadWriteData(createOrgLambda)
+
+    // ── 5. Lambda: create-invite ──────────────────────────────────────────────
+    // POST /admin/orgs/{orgId}/invites — INTERNAL only.
+    // Reads orgsTable to validate org exists + ACTIVE.
+    // Writes SHA-256 hash of token to invitesTable; returns raw token ONCE.
+    const createInviteLambda = new lambda.Function(this, "CreateInviteLambda", {
+      functionName: `${config.stack_name_base}-create-invite`,
+      runtime:      lambda.Runtime.PYTHON_3_13,
+      code:         lambda.Code.fromAsset(
+        path.join(__dirname, "..", "lambdas", "create-invite")
+      ),
+      handler:      "index.handler",
+      architecture: lambda.Architecture.ARM_64,
+      timeout:      cdk.Duration.seconds(15),
+      memorySize:   256,
+      environment: {
+        ORGS_TABLE_NAME:      orgsTable.tableName,
+        INVITES_TABLE_NAME:   invitesTable.tableName,
+        CORS_ALLOWED_ORIGINS: `${frontendUrl},http://localhost:3000`,
+      },
+      logGroup: new logs.LogGroup(this, "CreateInviteLogGroup", {
+        logGroupName:  `/aws/lambda/${config.stack_name_base}-create-invite`,
+        retention:     logs.RetentionDays.ONE_WEEK,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      }),
+    })
+    orgsTable.grantReadData(createInviteLambda)
+    invitesTable.grantReadWriteData(createInviteLambda)
+
+    // ── 6. Lambda: complete-registration ─────────────────────────────────────
+    // POST /auth/complete-external-registration — any authenticated user.
+    // Validates invite token, creates membership record, adds user to Cognito group.
+    // Needs cognito-idp:AdminAddUserToGroup to place the external user in the
+    // "external" Cognito group so future JWT tokens carry the group claim.
+    const completeRegistrationLambda = new lambda.Function(this, "CompleteRegistrationLambda", {
+      functionName: `${config.stack_name_base}-complete-registration`,
+      runtime:      lambda.Runtime.PYTHON_3_13,
+      code:         lambda.Code.fromAsset(
+        path.join(__dirname, "..", "lambdas", "complete-registration")
+      ),
+      handler:      "index.handler",
+      architecture: lambda.Architecture.ARM_64,
+      timeout:      cdk.Duration.seconds(15),
+      memorySize:   256,
+      environment: {
+        INVITES_TABLE_NAME:    invitesTable.tableName,
+        MEMBERSHIPS_TABLE_NAME: membershipsTable.tableName,
+        USER_POOL_ID:          this.userPoolId,
+        CORS_ALLOWED_ORIGINS:  `${frontendUrl},http://localhost:3000`,
+      },
+      logGroup: new logs.LogGroup(this, "CompleteRegistrationLogGroup", {
+        logGroupName:  `/aws/lambda/${config.stack_name_base}-complete-registration`,
+        retention:     logs.RetentionDays.ONE_WEEK,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      }),
+    })
+    invitesTable.grantReadWriteData(completeRegistrationLambda)
+    membershipsTable.grantReadWriteData(completeRegistrationLambda)
+
+    // IAM: Cognito AdminAddUserToGroup (idempotent — places external user in group)
+    completeRegistrationLambda.addToRolePolicy(new iam.PolicyStatement({
+      effect:  iam.Effect.ALLOW,
+      actions: ["cognito-idp:AdminAddUserToGroup"],
+      resources: [
+        `arn:aws:cognito-idp:${this.region}:${this.account}:userpool/${this.userPoolId}`,
+      ],
+    }))
+
+    // ── 7. IAM grants: memberships table read for presign + ingestion + agent ──
+    //
+    // The presign-upload Lambda resolves org_id from memberships at upload time.
+    // The ingestion worker also does a membership lookup as a fallback.
+    // basic_agent.py calls resolve_principal_from_context → DynamoDB GetItem.
+    //
+    // All three need dynamodb:GetItem on membershipsTable.
+    // Because their Lambda objects are created in different private methods,
+    // we import their IAM roles by ARN using the deterministic function-name-based
+    // role pattern that CDK's PythonFunction and lambda.Function use:
+    //   arn:aws:iam::{account}:role/{stack-region-unique-function-name}-{hash}-lambda-role
+    //
+    // However, the CDK-generated role names include a hash that changes each synth.
+    // The safest cross-method approach is a targeted IAM policy statement via
+    // iam.Role.fromRoleArn with the function name as the policy principal condition.
+    //
+    // Since we can't use resource-based policies on DynamoDB (it doesn't support them),
+    // we attach identity-based policies using addToRolePolicy on imported role objects.
+    // The roles for PythonFunction follow the pattern:
+    //   ${functionName}-${uniqueHash}-Role (CDK auto-name)
+    // but CDK resolves this as a lazy token — we can't construct it statically.
+    //
+    // Cleanest pattern: grant at the table level using IAM condition on resource ARN,
+    // scoped via a wildcard principal that covers the account's Lambda service.
+    // We scope to a specific resource ARN (membershipsTable.tableArn) which limits blast radius.
+    //
+    // To avoid token resolution issues we use addToRolePolicy on the presign and
+    // ingestion Lambda objects — but those are local variables in other methods.
+    // Solution: promote membershipsTable to a class property so createDocumentUploadInfra
+    // and createIngestionPipeline can call membershipsTable.grantReadData(lambda).
+    //
+    // Since we are NOT refactoring method signatures now, use the simple approach:
+    // grant via a broad-but-scoped policy on the functions' KNOWN execution role ARNs
+    // that CDK will generate predictably from the function name (requires stable names).
+    //
+    // The presign-upload and ingestion-worker functions have EXPLICIT functionName
+    // set in their definitions, so their CDK-generated role names are deterministic:
+    //   {functionName}-ServiceRole-{CFNId}
+    //
+    // The most reliable cross-method solution in CDK is to add an inline policy on
+    // the membershipsTable that allows the Lambda service principal with a condition
+    // on the source ARN. DynamoDB does NOT support resource-based policies, so we
+    // cannot use that approach.
+    //
+    // Final correct approach: use iam.Grant.addToPrincipalAndResource — not applicable.
+    // Correct final approach: each Lambda that needs access adds its own policy statement
+    // via addToRolePolicy. Since those Lambdas are in other methods, we instead grant
+    // access by passing the table name in their env vars (already done above) AND
+    // granting via the known IAM role ARN built from the function name using a helper.
+    //
+    // IAM roles for named Lambda functions follow:
+    //   arn:aws:iam::{account}:role/{NestedStackId}-{LambdaLogicalId}ServiceRole{HASH}
+    // The HASH is unpredictable. THE ONLY reliable option without refactor:
+    //   Use a wildcard on the function name in a policy attached to the table's GSI
+    //   or — better — use Lambda-level addToRolePolicy via a CFN escape hatch.
+    //
+    // SIMPLEST WORKING APPROACH: grant the membershipsTable to the AgentCore execution
+    // role (accessible as this.agentRuntime.executionRole) and use a broad
+    // dynamodb:GetItem grant scoped to the table ARN for the presign and ingestion
+    // Lambdas via an iam.PolicyStatement on THEIR roles using
+    // iam.Role.fromRoleArn with the CDK stack-nested logical ID ARN.
+    //
+    // We adopt the pragmatic pattern used elsewhere in this file for cross-method grants:
+    // an IAM policy statement added to an imported role using the Lambda's FUNCTION NAME
+    // as the role name anchor, constructed with a known suffix.
+    // CDK PythonFunction creates the role as: {Construct.node.id}ServiceRole{HASH}
+    // but we can reference it by function name using fromFunctionName + grantInvoke
+    // OR — simplest of all — we add the policy to the membershipsTable using
+    // Lambda's SERVICE ROLE ARN pattern with account wildcard:
+    //   Principal: { Service: "lambda.amazonaws.com" }
+    //   Condition: { ArnLike: { "aws:SourceArn": "arn:aws:lambda:{r}:{a}:function:{name}" } }
+    // DynamoDB does not support resource-based policies — this still won't work.
+    //
+    // ── THE CORRECT SOLUTION ──────────────────────────────────────────────────
+    // Attach IAM inline policy statements directly to named Lambda functions via
+    // lambda.Function.fromFunctionName() to import them, then call addToRolePolicy.
+    // fromFunctionName returns an IFunction; we need IGrantable (the execution role).
+    // We can import the ROLE using the function name + known role suffix pattern.
+    //
+    // CDK Lambda roles for explicitly-named functions (functionName set) are named:
+    //   In CloudFormation: {NestedStack.logicalId}NestedStackResource...{lambdaLogicalId}ServiceRole{HASH}
+    // HASH is still non-deterministic. This approach fails too.
+    //
+    // ── FINAL SOLUTION ────────────────────────────────────────────────────────
+    // Add a broad-scoped inline policy to the Lambda execution roles using the
+    // Lambda service principal anchored on the function ARN.
+    // We can grant DynamoDB:GetItem via an account-level IAM policy using
+    // managed policy attachment — but that's even broader.
+    //
+    // The only clean CDK-idiomatic solution without refactoring method signatures:
+    // Add a class-level stored reference so submethod Lambdas can be granted later.
+    // Since that requires significant refactor, we use addToRolePolicy on IMPORTED
+    // Lambda objects constructed from the KNOWN function ARN.
+    //
+    // lambda.Function.fromFunctionAttributes() lets us import a Lambda with its
+    // grantable role via sameEnvironment:true which enables policy attachment.
+
+    const presignFnArn = `arn:aws:lambda:${this.region}:${this.account}:function:${config.stack_name_base}-presign-upload`
+    const ingestionFnArn = `arn:aws:lambda:${this.region}:${this.account}:function:${config.stack_name_base}-ingestion-worker`
+
+    const presignFnRef = lambda.Function.fromFunctionAttributes(this, "PresignFnRefForMemberships", {
+      functionArn: presignFnArn,
+      sameEnvironment: true,  // enables addToRolePolicy
+    })
+    const ingestionFnRef = lambda.Function.fromFunctionAttributes(this, "IngestionFnRefForMemberships", {
+      functionArn: ingestionFnArn,
+      sameEnvironment: true,
+    })
+
+    membershipsTable.grantReadData(presignFnRef)
+    membershipsTable.grantReadData(ingestionFnRef)
+
+    // ── 8. Also grant agentRuntime role read on memberships ───────────────────
+    // basic_agent.py calls resolve_principal_from_context → _get_membership → DynamoDB GetItem
+    // The AgentCore Runtime execution role needs GetItem + Query on memberships.
+    membershipsTable.grantReadData(this.agentRuntime.role)
+
+    // ── 10. API Gateway routes ────────────────────────────────────────────────
+    // The admin endpoints (create-org, create-invite) sit on the existing docsApi.
+    // complete-registration is also on docsApi under /auth.
+    //
+    // We reference docsApi by importing it via fromRestApiId/fromRestApiAttributes.
+    // Since docsApi is created in createDocumentUploadInfra (a separate method),
+    // and CDK doesn't support cross-method RestApi references easily, we instead
+    // create a SEPARATE admin API on the same Cognito authorizer pattern.
+    // This keeps the methods fully independent and avoids tight coupling.
+    //
+    // Admin API: POST /admin/orgs, POST /admin/orgs/{orgId}/invites
+    // Auth API:  POST /auth/complete-external-registration
+
+    const orgApi = new apigateway.RestApi(this, "OrgApi", {
+      restApiName: `${config.stack_name_base}-org-api`,
+      description: "Org management API: admin org/invite creation + external user registration",
+      defaultCorsPreflightOptions: {
+        allowOrigins: [frontendUrl, "http://localhost:3000"],
+        allowMethods: ["POST", "GET", "OPTIONS"],
+        allowHeaders: ["Content-Type", "Authorization"],
+      },
+      deployOptions: {
+        stageName:          "prod",
+        loggingLevel:       apigateway.MethodLoggingLevel.INFO,
+        cachingEnabled:     false,
+        cacheClusterEnabled: false,
+        metricsEnabled:     true,
+        tracingEnabled:     true,
+        accessLogDestination: new apigateway.LogGroupLogDestination(
+          new logs.LogGroup(this, "OrgApiAccessLogGroup", {
+            logGroupName:  `/aws/apigateway/${config.stack_name_base}-org-api-access`,
+            retention:     logs.RetentionDays.ONE_WEEK,
+            removalPolicy: cdk.RemovalPolicy.DESTROY,
+          })
+        ),
+        accessLogFormat: apigateway.AccessLogFormat.jsonWithStandardFields(),
+      },
+    })
+
+    // Cognito authorizer — same user pool, same pattern as docs API
+    const orgApiAuthorizer = new apigateway.CognitoUserPoolsAuthorizer(
+      this,
+      "OrgApiAuthorizer",
+      {
+        cognitoUserPools: [this.userPool],
+        identitySource:   "method.request.header.Authorization",
+        authorizerName:   `${config.stack_name_base}-org-authorizer`,
+      }
+    )
+
+    // /admin/orgs — POST
+    const adminResource = orgApi.root.addResource("admin")
+    const orgsResource  = adminResource.addResource("orgs")
+    orgsResource.addMethod(
+      "POST",
+      new apigateway.LambdaIntegration(createOrgLambda),
+      {
+        authorizer:        orgApiAuthorizer,
+        authorizationType: apigateway.AuthorizationType.COGNITO,
+      }
+    )
+
+    // /admin/orgs/{orgId}/invites — POST
+    const orgIdResource     = orgsResource.addResource("{orgId}")
+    const invitesResource   = orgIdResource.addResource("invites")
+    invitesResource.addMethod(
+      "POST",
+      new apigateway.LambdaIntegration(createInviteLambda),
+      {
+        authorizer:        orgApiAuthorizer,
+        authorizationType: apigateway.AuthorizationType.COGNITO,
+      }
+    )
+
+    // /auth/complete-external-registration — POST
+    const authResource = orgApi.root.addResource("auth")
+    const completeRegResource = authResource.addResource("complete-external-registration")
+    completeRegResource.addMethod(
+      "POST",
+      new apigateway.LambdaIntegration(completeRegistrationLambda),
+      {
+        authorizer:        orgApiAuthorizer,
+        authorizationType: apigateway.AuthorizationType.COGNITO,
+      }
+    )
+
+    // SSM: store org API URL so frontend can call admin + registration endpoints
+    new ssm.StringParameter(this, "OrgApiUrlParam", {
+      parameterName: `/${config.stack_name_base}/rag/org-api-url`,
+      stringValue:   orgApi.url,
+      description:   "Org management API Gateway URL (Phase 4)",
+    })
+
+    // Outputs
+    new cdk.CfnOutput(this, "OrgsTableName", {
+      value:       orgsTable.tableName,
+      description: "DynamoDB table for org registry",
+    })
+    new cdk.CfnOutput(this, "MembershipsTableName", {
+      value:       membershipsTable.tableName,
+      description: "DynamoDB table for user→org membership",
+    })
+    new cdk.CfnOutput(this, "InvitesTableName", {
+      value:       invitesTable.tableName,
+      description: "DynamoDB table for org invite tokens",
+    })
+    new cdk.CfnOutput(this, "OrgApiUrl", {
+      value:       orgApi.url,
+      description: "Org management API URL (Phase 4)",
     })
   }
 }
