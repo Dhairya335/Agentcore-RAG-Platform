@@ -49,9 +49,11 @@ export class CognitoStack extends cdk.NestedStack {
       timeout:      cdk.Duration.seconds(10),
       memorySize:   128,
       environment: {
-        // USER_POOL_ID cannot be set here because the pool doesn't exist yet.
-        // It is injected below via addEnvironment after pool creation.
-        USER_POOL_ID:        "PLACEHOLDER",
+        // USER_POOL_ID is intentionally NOT set here — reading it from the CDK
+        // token (userPool.userPoolId) would create a circular dependency:
+        //   UserPool → Lambda (LambdaConfig) ←→ Lambda → UserPool (USER_POOL_ID env)
+        // The Lambda reads pool_id directly from event["userPoolId"] instead,
+        // which Cognito always provides in the trigger event payload.
         EXTERNAL_GROUP_NAME: "external",
       },
       logGroup: new logs.LogGroup(this, "PostConfirmationLogGroup", {
@@ -113,10 +115,6 @@ export class CognitoStack extends cdk.NestedStack {
 <p>${config.stack_name_base} Team</p>`,
       },
     })
-
-    // Inject the real User Pool ID now that the pool object exists.
-    // CDK resolves this as a CloudFormation token reference — not a hardcoded string.
-    postConfirmationLambda.addEnvironment("USER_POOL_ID", userPool.userPoolId)
 
     // Grant the post-confirmation Lambda permission to call AdminAddUserToGroup.
     // Using "*" resource to avoid any UserPool ARN reference before the pool exists.

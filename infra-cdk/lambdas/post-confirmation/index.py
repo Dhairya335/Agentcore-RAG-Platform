@@ -28,7 +28,10 @@ import boto3
 
 cognito = boto3.client("cognito-idp")
 
-USER_POOL_ID    = os.environ["USER_POOL_ID"]
+# pool_id is read from event["userPoolId"] — Cognito always provides it in the
+# trigger payload. We do NOT read USER_POOL_ID from env because that would
+# require a CDK token reference back to the UserPool, causing a circular
+# dependency with LambdaConfig.PostConfirmation on the same UserPool resource.
 EXTERNAL_GROUP  = os.environ.get("EXTERNAL_GROUP_NAME", "external")
 
 
