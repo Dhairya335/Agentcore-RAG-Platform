@@ -47,6 +47,8 @@ export class BackendStack extends cdk.NestedStack {
   private agentRuntime: agentcore.Runtime
   private gateway: bedrockagentcore.CfnGateway
   private gatewayRole: iam.Role
+  private presignLambda: lambda.IFunction
+  private ingestionLambda: lambda.IFunction
 
   constructor(scope: Construct, id: string, props: BackendStackProps) {
     super(scope, id, props)
@@ -819,7 +821,8 @@ export class BackendStack extends cdk.NestedStack {
 
     // 3. PRESIGN UPLOAD LAMBDA
     // The frontend cannot talk to S3 directly (no AWS creds).
-    const presignLambda = new PythonFunction(this, "PresignUploadLambda", {
+    // Stored as class property so createOrgTenancyInfra() can grant membershipsTable read.
+    this.presignLambda = new PythonFunction(this, "PresignUploadLambda", {
       functionName: `${config.stack_name_base}-presign-upload`,
       runtime: lambda.Runtime.PYTHON_3_13,
       entry: path.join(__dirname, "..", "lambdas", "presign-upload"),
@@ -845,10 +848,10 @@ export class BackendStack extends cdk.NestedStack {
     })
 
     // Grant Lambda permission to generate presigned URLs for this bucket
-    rawDocsBucket.grantPut(presignLambda)
+    rawDocsBucket.grantPut(this.presignLambda)
 
     // Grant Lambda permission to read/write DynamoDB records
-    docsTable.grantReadWriteData(presignLambda)
+    docsTable.grantReadWriteData(this.presignLambda)
 
     // 4. API GATEWAY ROUTE: POST /documents/presign
     //
@@ -935,7 +938,7 @@ export class BackendStack extends cdk.NestedStack {
 
     presignResource.addMethod(
       "POST",
-      new apigateway.LambdaIntegration(presignLambda),
+      new apigateway.LambdaIntegration(this.presignLambda),
       {
         authorizer: docsAuthorizer,
         authorizationType: apigateway.AuthorizationType.COGNITO,
@@ -1282,7 +1285,8 @@ export class BackendStack extends cdk.NestedStack {
     // PythonFunction (not lambda.Function) auto-reads requirements.txt and bundles
     // PyPDF2, python-docx, openpyxl, tiktoken into a Lambda layer at deploy time.
     // lambda.Function + Code.fromAsset does NOT install pip dependencies.
-    const ingestionLambda = new PythonFunction(this, "IngestionWorkerLambda", {
+    // Stored as class property so createOrgTenancyInfra() can grant membershipsTable read.
+    this.ingestionLambda = new PythonFunction(this, "IngestionWorkerLambda", {
       functionName: `${config.stack_name_base}-ingestion-worker`,
       runtime:      lambda.Runtime.PYTHON_3_13,
       entry:        path.join(__dirname, "..", "lambdas", "ingestion-worker"),
@@ -1309,10 +1313,10 @@ export class BackendStack extends cdk.NestedStack {
     //    IAM PERMISSIONS          ─
 
     // S3: read the uploaded document
-    rawDocsBucket.grantRead(ingestionLambda)
+    rawDocsBucket.grantRead(this.ingestionLambda)
 
     // DynamoDB: update document status UPLOADED → READY / FAILED
-    ingestionLambda.addToRolePolicy(new iam.PolicyStatement({
+    this.ingestionLambda.addToRolePolicy(new iam.PolicyStatement({
       effect:  iam.Effect.ALLOW,
       actions: ["dynamodb:UpdateItem", "dynamodb:GetItem"],
       resources: [
@@ -1321,7 +1325,7 @@ export class BackendStack extends cdk.NestedStack {
     }))
 
     // Bedrock: invoke Titan Embed V2 for embedding generation
-    ingestionLambda.addToRolePolicy(new iam.PolicyStatement({
+    this.ingestionLambda.addToRolePolicy(new iam.PolicyStatement({
       effect:  iam.Effect.ALLOW,
       actions: ["bedrock:InvokeModel"],
       resources: [
@@ -1330,7 +1334,7 @@ export class BackendStack extends cdk.NestedStack {
     }))
 
     // RDS Data API: execute SQL against Aurora pgvector cluster
-    ingestionLambda.addToRolePolicy(new iam.PolicyStatement({
+    this.ingestionLambda.addToRolePolicy(new iam.PolicyStatement({
       effect:  iam.Effect.ALLOW,
       actions: [
         "rds-data:ExecuteStatement",
@@ -1340,14 +1344,14 @@ export class BackendStack extends cdk.NestedStack {
     }))
 
     // Secrets Manager: read Aurora credentials (required by RDS Data API)
-    ingestionLambda.addToRolePolicy(new iam.PolicyStatement({
+    this.ingestionLambda.addToRolePolicy(new iam.PolicyStatement({
       effect:  iam.Effect.ALLOW,
       actions: ["secretsmanager:GetSecretValue"],
       resources: ["*"],  // secret ARN read from SSM at runtime
     }))
 
     // SSM: read Aurora ARNs + db name stored by createVectorStore
-    ingestionLambda.addToRolePolicy(new iam.PolicyStatement({
+    this.ingestionLambda.addToRolePolicy(new iam.PolicyStatement({
       effect:  iam.Effect.ALLOW,
       actions: ["ssm:GetParameter"],
       resources: [
@@ -1358,14 +1362,14 @@ export class BackendStack extends cdk.NestedStack {
     //    SQS EVENT SOURCE          
     // batchSize=1: process one S3 object per Lambda invocation.
     // This keeps error isolation clean — one bad file doesn't block others.
-    ingestionLambda.addEventSource(new SqsEventSource(ingestionQueue, {
+    this.ingestionLambda.addEventSource(new SqsEventSource(ingestionQueue, {
       batchSize:               1,
       maxConcurrency:          5,   // max 5 parallel ingestion jobs
       reportBatchItemFailures: true,
     }))
 
     //    SQS GRANT                ─
-    ingestionQueue.grantConsumeMessages(ingestionLambda)
+    ingestionQueue.grantConsumeMessages(this.ingestionLambda)
 
     new cdk.CfnOutput(this, "IngestionQueueUrl", {
       value:       ingestionQueue.queueUrl,
@@ -1954,120 +1958,12 @@ export class BackendStack extends cdk.NestedStack {
     }))
 
     // ── 7. IAM grants: memberships table read for presign + ingestion + agent ──
-    //
-    // The presign-upload Lambda resolves org_id from memberships at upload time.
-    // The ingestion worker also does a membership lookup as a fallback.
-    // basic_agent.py calls resolve_principal_from_context → DynamoDB GetItem.
-    //
-    // All three need dynamodb:GetItem on membershipsTable.
-    // Because their Lambda objects are created in different private methods,
-    // we import their IAM roles by ARN using the deterministic function-name-based
-    // role pattern that CDK's PythonFunction and lambda.Function use:
-    //   arn:aws:iam::{account}:role/{stack-region-unique-function-name}-{hash}-lambda-role
-    //
-    // However, the CDK-generated role names include a hash that changes each synth.
-    // The safest cross-method approach is a targeted IAM policy statement via
-    // iam.Role.fromRoleArn with the function name as the policy principal condition.
-    //
-    // Since we can't use resource-based policies on DynamoDB (it doesn't support them),
-    // we attach identity-based policies using addToRolePolicy on imported role objects.
-    // The roles for PythonFunction follow the pattern:
-    //   ${functionName}-${uniqueHash}-Role (CDK auto-name)
-    // but CDK resolves this as a lazy token — we can't construct it statically.
-    //
-    // Cleanest pattern: grant at the table level using IAM condition on resource ARN,
-    // scoped via a wildcard principal that covers the account's Lambda service.
-    // We scope to a specific resource ARN (membershipsTable.tableArn) which limits blast radius.
-    //
-    // To avoid token resolution issues we use addToRolePolicy on the presign and
-    // ingestion Lambda objects — but those are local variables in other methods.
-    // Solution: promote membershipsTable to a class property so createDocumentUploadInfra
-    // and createIngestionPipeline can call membershipsTable.grantReadData(lambda).
-    //
-    // Since we are NOT refactoring method signatures now, use the simple approach:
-    // grant via a broad-but-scoped policy on the functions' KNOWN execution role ARNs
-    // that CDK will generate predictably from the function name (requires stable names).
-    //
-    // The presign-upload and ingestion-worker functions have EXPLICIT functionName
-    // set in their definitions, so their CDK-generated role names are deterministic:
-    //   {functionName}-ServiceRole-{CFNId}
-    //
-    // The most reliable cross-method solution in CDK is to add an inline policy on
-    // the membershipsTable that allows the Lambda service principal with a condition
-    // on the source ARN. DynamoDB does NOT support resource-based policies, so we
-    // cannot use that approach.
-    //
-    // Final correct approach: use iam.Grant.addToPrincipalAndResource — not applicable.
-    // Correct final approach: each Lambda that needs access adds its own policy statement
-    // via addToRolePolicy. Since those Lambdas are in other methods, we instead grant
-    // access by passing the table name in their env vars (already done above) AND
-    // granting via the known IAM role ARN built from the function name using a helper.
-    //
-    // IAM roles for named Lambda functions follow:
-    //   arn:aws:iam::{account}:role/{NestedStackId}-{LambdaLogicalId}ServiceRole{HASH}
-    // The HASH is unpredictable. THE ONLY reliable option without refactor:
-    //   Use a wildcard on the function name in a policy attached to the table's GSI
-    //   or — better — use Lambda-level addToRolePolicy via a CFN escape hatch.
-    //
-    // SIMPLEST WORKING APPROACH: grant the membershipsTable to the AgentCore execution
-    // role (accessible as this.agentRuntime.executionRole) and use a broad
-    // dynamodb:GetItem grant scoped to the table ARN for the presign and ingestion
-    // Lambdas via an iam.PolicyStatement on THEIR roles using
-    // iam.Role.fromRoleArn with the CDK stack-nested logical ID ARN.
-    //
-    // We adopt the pragmatic pattern used elsewhere in this file for cross-method grants:
-    // an IAM policy statement added to an imported role using the Lambda's FUNCTION NAME
-    // as the role name anchor, constructed with a known suffix.
-    // CDK PythonFunction creates the role as: {Construct.node.id}ServiceRole{HASH}
-    // but we can reference it by function name using fromFunctionName + grantInvoke
-    // OR — simplest of all — we add the policy to the membershipsTable using
-    // Lambda's SERVICE ROLE ARN pattern with account wildcard:
-    //   Principal: { Service: "lambda.amazonaws.com" }
-    //   Condition: { ArnLike: { "aws:SourceArn": "arn:aws:lambda:{r}:{a}:function:{name}" } }
-    // DynamoDB does not support resource-based policies — this still won't work.
-    //
-    // ── THE CORRECT SOLUTION ──────────────────────────────────────────────────
-    // Attach IAM inline policy statements directly to named Lambda functions via
-    // lambda.Function.fromFunctionName() to import them, then call addToRolePolicy.
-    // fromFunctionName returns an IFunction; we need IGrantable (the execution role).
-    // We can import the ROLE using the function name + known role suffix pattern.
-    //
-    // CDK Lambda roles for explicitly-named functions (functionName set) are named:
-    //   In CloudFormation: {NestedStack.logicalId}NestedStackResource...{lambdaLogicalId}ServiceRole{HASH}
-    // HASH is still non-deterministic. This approach fails too.
-    //
-    // ── FINAL SOLUTION ────────────────────────────────────────────────────────
-    // Add a broad-scoped inline policy to the Lambda execution roles using the
-    // Lambda service principal anchored on the function ARN.
-    // We can grant DynamoDB:GetItem via an account-level IAM policy using
-    // managed policy attachment — but that's even broader.
-    //
-    // The only clean CDK-idiomatic solution without refactoring method signatures:
-    // Add a class-level stored reference so submethod Lambdas can be granted later.
-    // Since that requires significant refactor, we use addToRolePolicy on IMPORTED
-    // Lambda objects constructed from the KNOWN function ARN.
-    //
-    // lambda.Function.fromFunctionAttributes() lets us import a Lambda with its
-    // grantable role via sameEnvironment:true which enables policy attachment.
+    // presignLambda and ingestionLambda are stored as class properties so we can
+    // grant them here without needing to pass objects across method boundaries.
+    membershipsTable.grantReadData(this.presignLambda)
+    membershipsTable.grantReadData(this.ingestionLambda)
 
-    const presignFnArn = `arn:aws:lambda:${this.region}:${this.account}:function:${config.stack_name_base}-presign-upload`
-    const ingestionFnArn = `arn:aws:lambda:${this.region}:${this.account}:function:${config.stack_name_base}-ingestion-worker`
-
-    const presignFnRef = lambda.Function.fromFunctionAttributes(this, "PresignFnRefForMemberships", {
-      functionArn: presignFnArn,
-      sameEnvironment: true,  // enables addToRolePolicy
-    })
-    const ingestionFnRef = lambda.Function.fromFunctionAttributes(this, "IngestionFnRefForMemberships", {
-      functionArn: ingestionFnArn,
-      sameEnvironment: true,
-    })
-
-    membershipsTable.grantReadData(presignFnRef)
-    membershipsTable.grantReadData(ingestionFnRef)
-
-    // ── 8. Also grant agentRuntime role read on memberships ───────────────────
-    // basic_agent.py calls resolve_principal_from_context → _get_membership → DynamoDB GetItem
-    // The AgentCore Runtime execution role needs GetItem + Query on memberships.
+    // basic_agent.py → resolve_principal_from_context → DynamoDB GetItem on memberships
     membershipsTable.grantReadData(this.agentRuntime.role)
 
     // ── 10. API Gateway routes ────────────────────────────────────────────────
