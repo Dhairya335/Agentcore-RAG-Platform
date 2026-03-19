@@ -35,10 +35,13 @@ cognito   = boto3.client("cognito-idp")
 
 MEMBERSHIPS_TABLE_NAME = os.environ["MEMBERSHIPS_TABLE_NAME"]
 INVITES_TABLE_NAME     = os.environ["INVITES_TABLE_NAME"]
+ORGS_TABLE_NAME        = os.environ["ORGS_TABLE_NAME"]
 USER_POOL_ID           = os.environ["USER_POOL_ID"]
-EXTERNAL_GROUP         = os.environ.get("EXTERNAL_GROUP", "external")
-CORS_ALLOWED_ORIGINS   = os.environ.get("CORS_ALLOWED_ORIGINS", "*")
-cors_origins = [o.strip() for o in CORS_ALLOWED_ORIGINS.split(",") if o.strip()]
+# EXTERNAL_GROUP is stable Cognito group name — "external" is the only valid value
+# in this deployment. Hard-coded rather than configurable to prevent misconfiguration.
+EXTERNAL_GROUP         = "external"
+CORS_ALLOWED_ORIGINS   = os.environ["CORS_ALLOWED_ORIGINS"]  # required; no silent default
+cors_origins           = [o.strip() for o in CORS_ALLOWED_ORIGINS.split(",") if o.strip()]
 
 
 def handler(event, context):
@@ -116,7 +119,7 @@ def handler(event, context):
         if existing.get("membership_status") == "ACTIVE" and existing.get("org_id") == org_id:
             # Idempotent: user already registered to the same org
             print(f"[REG] Idempotent re-registration: user={user_sub} org={org_id}")
-            return _success(org_id, event)
+            return _success(org_id, user_sub, user_email, event)
         else:
             # Different org or non-ACTIVE status — reject with security log
             print(
@@ -141,6 +144,7 @@ def handler(event, context):
                 "role_class":        role_class,
                 "membership_status": "ACTIVE",
                 "invited_by":        invite.get("created_by", ""),
+                "joined_at":         now_iso,
                 "created_at":        now_iso,
                 "updated_at":        now_iso,
             },
@@ -156,7 +160,7 @@ def handler(event, context):
         item2 = resp2.get("Item")
         if item2 and item2.get("org_id") == org_id and item2.get("membership_status") == "ACTIVE":
             print(f"[REG] Race idempotent for user={user_sub} org={org_id}")
-            return _success(org_id, event)
+            return _success(org_id, user_sub, user_email, event)
         return _error(409, "Concurrent registration conflict — please retry", event)
     except Exception as e:
         return _error(500, f"Failed to write membership: {e}", event)
@@ -200,10 +204,70 @@ def handler(event, context):
         f"org={org_id} role={role_class}"
     )
 
-    return _success(org_id, event)
+    # Fetch org_name for the response — required field, not a fallback
+    org_name = _fetch_org_name(org_id=org_id)
+    if org_name is None:
+        # Membership was written successfully, but org record lookup failed.
+        # Return 500 so the frontend knows the response is incomplete.
+        print(f"[REG] Org record not found after successful membership write: org_id={org_id}")
+        return _error(
+            500,
+            f"Registration succeeded but organisation '{org_id}' record could not be retrieved — "
+            "contact administrator.",
+            event,
+        )
+
+    return _success(
+        org_id=org_id,
+        org_name=org_name,
+        user_sub=user_sub,
+        user_email=user_email,
+        event=event,
+    )
 
 
-def _success(org_id: str, event) -> dict:
+def _fetch_org_name(org_id: str) -> str | None:
+    """
+    Fetch the org_name field from the orgs table for the given org_id.
+
+    Args:
+        org_id: The organisation identifier to look up.
+
+    Returns:
+        The org_name string if the record exists and contains the field,
+        or None if the record is not found or the DynamoDB call fails.
+        Callers must treat None as a hard error and return HTTP 500.
+    """
+    orgs_table = dynamodb.Table(ORGS_TABLE_NAME)
+    try:
+        resp = orgs_table.get_item(
+            Key={"org_id": org_id},
+            ConsistentRead=True,
+        )
+    except Exception as exc:
+        print(f"[REG] DynamoDB GetItem failed for org_id={org_id}: {exc}")
+        return None
+
+    item = resp.get("Item")
+    if not item:
+        return None
+    return item.get("org_name")  # None if field is unexpectedly absent
+
+
+def _success(org_id: str, org_name: str, user_sub: str, user_email: str, event: dict) -> dict:
+    """
+    Build a successful (200) registration response.
+
+    Args:
+        org_id:     The organisation ID the user was registered into.
+        org_name:   The human-readable organisation name.
+        user_sub:   Cognito user sub (userId).
+        user_email: Authenticated user's email address.
+        event:      Original Lambda event (used to resolve CORS origin).
+
+    Returns:
+        API Gateway response dict with statusCode=200.
+    """
     return {
         "statusCode": 200,
         "headers": {
@@ -211,16 +275,30 @@ def _success(org_id: str, event) -> dict:
             "Access-Control-Allow-Origin": _cors_origin(event),
         },
         "body": json.dumps({
-            "registrationStatus": "COMPLETE",
-            "orgId":              org_id,
-            "tokenRefreshRequired": True,  # Cognito group claim needs refresh
+            "registrationStatus":   "COMPLETE",
+            "orgId":                org_id,
+            "orgName":              org_name,
+            "userId":               user_sub,
+            "email":                user_email,
+            "tokenRefreshRequired": True,   # caller must refresh Cognito tokens for new group claim
         }),
     }
 
 
-def _cors_origin(event):
-    request_origin = (event.get("headers") or {}).get("origin", "")
-    return request_origin if request_origin in cors_origins else (cors_origins[0] if cors_origins else "*")
+def _cors_origin(event: dict) -> str:
+    """
+    Resolve the CORS Access-Control-Allow-Origin response header value.
+
+    Args:
+        event: API Gateway Lambda proxy event.
+
+    Returns:
+        Allowed origin string. Raises IndexError if cors_origins is empty.
+    """
+    request_origin: str = (event.get("headers") or {}).get("origin", "")
+    if request_origin in cors_origins:
+        return request_origin
+    return cors_origins[0]
 
 
 def _error(status_code, message, event={}):

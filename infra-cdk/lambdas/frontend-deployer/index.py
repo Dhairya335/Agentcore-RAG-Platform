@@ -25,11 +25,12 @@ FLOW:
 """
 
 import json
-import urllib.request
-import boto3
 import os
 import tempfile
+import urllib.request
 import zipfile
+
+import boto3
 
 amplify_client = boto3.client("amplify")
 s3_client      = boto3.client("s3")
@@ -38,15 +39,6 @@ ssm_client     = boto3.client("ssm")
 
 def get_ssm(name):
     return ssm_client.get_parameter(Name=name)["Parameter"]["Value"]
-
-
-def get_ssm_optional(name, default=""):
-    """Read an SSM parameter, returning default if it doesn't exist yet."""
-    try:
-        return ssm_client.get_parameter(Name=name)["Parameter"]["Value"]
-    except ssm_client.exceptions.ParameterNotFound:
-        print(f"WARNING: SSM parameter {name} not found, using default: '{default}'")
-        return default
 
 
 def build_aws_exports(stack_name, amplify_url, region):
@@ -63,7 +55,8 @@ def build_aws_exports(stack_name, amplify_url, region):
         "agentRuntimeArn":        get_ssm(f"{prefix}/runtime-arn"),
         "awsRegion":              region,
         "feedbackApiUrl":         get_ssm(f"{prefix}/feedback-api-url"),
-        "docsApiUrl":             get_ssm_optional(f"{prefix}/rag/docs-api-url"),
+        "docsApiUrl":             get_ssm(f"{prefix}/rag/docs-api-url"),
+        "orgApiUrl":              get_ssm(f"{prefix}/rag/org-api-url"),
         "agentPattern":           "strands-single-agent",
     }, indent=2)
 

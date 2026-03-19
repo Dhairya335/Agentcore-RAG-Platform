@@ -1,5 +1,6 @@
 import { Button } from "@/components/ui/button"
-import { Plus, BookOpen } from "lucide-react"
+import { Plus, BookOpen, Building2 } from "lucide-react"
+import { useNavigate } from "react-router-dom"
 import { useAuth } from "@/hooks/useAuth"
 import { useIsInternal } from "@/hooks/useUserRole"
 import {
@@ -24,6 +25,7 @@ type ChatHeaderProps = {
 export function ChatHeader({ title, onNewChat, canStartNewChat, onLibraryOpen }: ChatHeaderProps) {
   const { isAuthenticated, signOut } = useAuth()
   const isInternal = useIsInternal()
+  const navigate   = useNavigate()
 
   return (
     <header className="flex items-center justify-between p-4 border-b w-full">
@@ -31,6 +33,11 @@ export function ChatHeader({ title, onNewChat, canStartNewChat, onLibraryOpen }:
         {isInternal && onLibraryOpen && (
           <Button variant="ghost" size="icon" onClick={onLibraryOpen} title="Knowledge Base" className="text-gray-500 hover:text-blue-600">
             <BookOpen className="h-5 w-5" />
+          </Button>
+        )}
+        {isInternal && (
+          <Button variant="ghost" size="icon" onClick={() => navigate("/admin/orgs")} title="Admin: Organisations" className="text-gray-500 hover:text-blue-600">
+            <Building2 className="h-5 w-5" />
           </Button>
         )}
         <h1 className="text-xl font-bold">{title || "Fullstack AgentCore Solution Template"}</h1>

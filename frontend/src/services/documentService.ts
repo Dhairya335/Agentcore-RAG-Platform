@@ -25,7 +25,10 @@ async function loadDocsApiUrl(): Promise<string> {
 export interface PresignRequest {
   fileName: string
   contentType: string
-  tenantId: string       // v1: same as Cognito userId extracted from token
+  /** @deprecated Phase 3 org-tenancy: org_id now resolved server-side from
+   *  DynamoDB memberships. This field is accepted for backward compat but
+   *  ignored by the backend. Will be removed in a future cleanup. */
+  tenantId?: string
   docId?: string         // omit for new doc, pass to upload new version
   metadata?: Record<string, string>
 }

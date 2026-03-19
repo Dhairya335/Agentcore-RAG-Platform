@@ -1832,7 +1832,7 @@ export class BackendStack extends cdk.NestedStack {
     })
 
     membershipsTable.addGlobalSecondaryIndex({
-      indexName:     "org_id-index",
+      indexName:     "org-id-index",
       partitionKey:  { name: "org_id",     type: dynamodb.AttributeType.STRING },
       sortKey:       { name: "created_at", type: dynamodb.AttributeType.STRING },
       projectionType: dynamodb.ProjectionType.ALL,
@@ -1857,6 +1857,14 @@ export class BackendStack extends cdk.NestedStack {
       // TTL: items auto-deleted after expires_at epoch seconds passes
       timeToLiveAttribute: "expires_at",
       pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
+    })
+
+    // GSI: query all invites for an org (used by get-org-detail admin panel)
+    invitesTable.addGlobalSecondaryIndex({
+      indexName:     "org-id-index",
+      partitionKey:  { name: "org_id",     type: dynamodb.AttributeType.STRING },
+      sortKey:       { name: "created_at", type: dynamodb.AttributeType.STRING },
+      projectionType: dynamodb.ProjectionType.ALL,
     })
 
     new ssm.StringParameter(this, "InvitesTableParam", {
@@ -1907,6 +1915,7 @@ export class BackendStack extends cdk.NestedStack {
       environment: {
         ORGS_TABLE_NAME:      orgsTable.tableName,
         INVITES_TABLE_NAME:   invitesTable.tableName,
+        FRONTEND_URL:         frontendUrl,
         CORS_ALLOWED_ORIGINS: `${frontendUrl},http://localhost:3000`,
       },
       logGroup: new logs.LogGroup(this, "CreateInviteLogGroup", {
@@ -1936,6 +1945,7 @@ export class BackendStack extends cdk.NestedStack {
       environment: {
         INVITES_TABLE_NAME:    invitesTable.tableName,
         MEMBERSHIPS_TABLE_NAME: membershipsTable.tableName,
+        ORGS_TABLE_NAME:       orgsTable.tableName,
         USER_POOL_ID:          this.userPoolId,
         CORS_ALLOWED_ORIGINS:  `${frontendUrl},http://localhost:3000`,
       },
@@ -1947,6 +1957,7 @@ export class BackendStack extends cdk.NestedStack {
     })
     invitesTable.grantReadWriteData(completeRegistrationLambda)
     membershipsTable.grantReadWriteData(completeRegistrationLambda)
+    orgsTable.grantReadData(completeRegistrationLambda)
 
     // IAM: Cognito AdminAddUserToGroup (idempotent — places external user in group)
     completeRegistrationLambda.addToRolePolicy(new iam.PolicyStatement({
@@ -1966,18 +1977,97 @@ export class BackendStack extends cdk.NestedStack {
     // basic_agent.py → resolve_principal_from_context → DynamoDB GetItem on memberships
     membershipsTable.grantReadData(this.agentRuntime.role)
 
+    // ── 8. Lambda: session-context ────────────────────────────────────────────
+    // GET /auth/session-context — any authenticated user.
+    // Returns authoritative session state: roleClass, membershipStatus, orgId,
+    // orgName, and capabilities flags. Frontend calls this once on app load.
+    const sessionContextLambda = new lambda.Function(this, "SessionContextLambda", {
+      functionName: `${config.stack_name_base}-session-context`,
+      runtime:      lambda.Runtime.PYTHON_3_13,
+      code:         lambda.Code.fromAsset(
+        path.join(__dirname, "..", "lambdas", "session-context")
+      ),
+      handler:      "index.handler",
+      architecture: lambda.Architecture.ARM_64,
+      timeout:      cdk.Duration.seconds(10),
+      memorySize:   256,
+      environment: {
+        MEMBERSHIPS_TABLE_NAME: membershipsTable.tableName,
+        ORGS_TABLE_NAME:        orgsTable.tableName,
+        CORS_ALLOWED_ORIGINS:   `${frontendUrl},http://localhost:3000`,
+      },
+      logGroup: new logs.LogGroup(this, "SessionContextLogGroup", {
+        logGroupName:  `/aws/lambda/${config.stack_name_base}-session-context`,
+        retention:     logs.RetentionDays.ONE_WEEK,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      }),
+    })
+    membershipsTable.grantReadData(sessionContextLambda)
+    orgsTable.grantReadData(sessionContextLambda)
+
+    // ── 9. Lambda: list-orgs ─────────────────────────────────────────────────
+    // GET /admin/orgs — INTERNAL only. Returns all orgs.
+    const listOrgsLambda = new lambda.Function(this, "ListOrgsLambda", {
+      functionName: `${config.stack_name_base}-list-orgs`,
+      runtime:      lambda.Runtime.PYTHON_3_13,
+      code:         lambda.Code.fromAsset(
+        path.join(__dirname, "..", "lambdas", "list-orgs")
+      ),
+      handler:      "index.handler",
+      architecture: lambda.Architecture.ARM_64,
+      timeout:      cdk.Duration.seconds(15),
+      memorySize:   256,
+      environment: {
+        ORGS_TABLE_NAME:        orgsTable.tableName,
+        MEMBERSHIPS_TABLE_NAME: membershipsTable.tableName,
+        CORS_ALLOWED_ORIGINS:   `${frontendUrl},http://localhost:3000`,
+      },
+      logGroup: new logs.LogGroup(this, "ListOrgsLogGroup", {
+        logGroupName:  `/aws/lambda/${config.stack_name_base}-list-orgs`,
+        retention:     logs.RetentionDays.ONE_WEEK,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      }),
+    })
+    orgsTable.grantReadData(listOrgsLambda)
+    membershipsTable.grantReadData(listOrgsLambda)
+
+    // ── 9b. Lambda: get-org-detail ────────────────────────────────────────────
+    // GET /admin/orgs/{orgId} — INTERNAL only. Returns org + members + invites.
+    const getOrgDetailLambda = new lambda.Function(this, "GetOrgDetailLambda", {
+      functionName: `${config.stack_name_base}-get-org-detail`,
+      runtime:      lambda.Runtime.PYTHON_3_13,
+      code:         lambda.Code.fromAsset(
+        path.join(__dirname, "..", "lambdas", "get-org-detail")
+      ),
+      handler:      "index.handler",
+      architecture: lambda.Architecture.ARM_64,
+      timeout:      cdk.Duration.seconds(15),
+      memorySize:   256,
+      environment: {
+        ORGS_TABLE_NAME:        orgsTable.tableName,
+        MEMBERSHIPS_TABLE_NAME: membershipsTable.tableName,
+        INVITES_TABLE_NAME:     invitesTable.tableName,
+        CORS_ALLOWED_ORIGINS:   `${frontendUrl},http://localhost:3000`,
+      },
+      logGroup: new logs.LogGroup(this, "GetOrgDetailLogGroup", {
+        logGroupName:  `/aws/lambda/${config.stack_name_base}-get-org-detail`,
+        retention:     logs.RetentionDays.ONE_WEEK,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      }),
+    })
+    orgsTable.grantReadData(getOrgDetailLambda)
+    membershipsTable.grantReadData(getOrgDetailLambda)
+    invitesTable.grantReadData(getOrgDetailLambda)
+
     // ── 10. API Gateway routes ────────────────────────────────────────────────
-    // The admin endpoints (create-org, create-invite) sit on the existing docsApi.
-    // complete-registration is also on docsApi under /auth.
-    //
-    // We reference docsApi by importing it via fromRestApiId/fromRestApiAttributes.
-    // Since docsApi is created in createDocumentUploadInfra (a separate method),
-    // and CDK doesn't support cross-method RestApi references easily, we instead
-    // create a SEPARATE admin API on the same Cognito authorizer pattern.
-    // This keeps the methods fully independent and avoids tight coupling.
-    //
-    // Admin API: POST /admin/orgs, POST /admin/orgs/{orgId}/invites
-    // Auth API:  POST /auth/complete-external-registration
+    // Separate org-api RestApi for admin + auth endpoints.
+    // Routes:
+    //   GET  /auth/session-context                    — session bootstrap (any authenticated user)
+    //   POST /auth/complete-external-registration     — invite acceptance
+    //   POST /admin/orgs                              — create org (INTERNAL only)
+    //   GET  /admin/orgs                              — list orgs  (INTERNAL only)
+    //   GET  /admin/orgs/{orgId}                      — org detail (INTERNAL only)
+    //   POST /admin/orgs/{orgId}/invites              — create invite (INTERNAL only)
 
     const orgApi = new apigateway.RestApi(this, "OrgApi", {
       restApiName: `${config.stack_name_base}-org-api`,
@@ -2016,7 +2106,19 @@ export class BackendStack extends cdk.NestedStack {
       }
     )
 
-    // /admin/orgs — POST
+    // /auth/session-context — GET (any authenticated user)
+    const authResource        = orgApi.root.addResource("auth")
+    const sessionCtxResource  = authResource.addResource("session-context")
+    sessionCtxResource.addMethod(
+      "GET",
+      new apigateway.LambdaIntegration(sessionContextLambda),
+      {
+        authorizer:        orgApiAuthorizer,
+        authorizationType: apigateway.AuthorizationType.COGNITO,
+      }
+    )
+
+    // /admin/orgs — POST + GET
     const adminResource = orgApi.root.addResource("admin")
     const orgsResource  = adminResource.addResource("orgs")
     orgsResource.addMethod(
@@ -2027,9 +2129,27 @@ export class BackendStack extends cdk.NestedStack {
         authorizationType: apigateway.AuthorizationType.COGNITO,
       }
     )
+    orgsResource.addMethod(
+      "GET",
+      new apigateway.LambdaIntegration(listOrgsLambda),
+      {
+        authorizer:        orgApiAuthorizer,
+        authorizationType: apigateway.AuthorizationType.COGNITO,
+      }
+    )
+
+    // /admin/orgs/{orgId} — GET
+    const orgIdResource = orgsResource.addResource("{orgId}")
+    orgIdResource.addMethod(
+      "GET",
+      new apigateway.LambdaIntegration(getOrgDetailLambda),
+      {
+        authorizer:        orgApiAuthorizer,
+        authorizationType: apigateway.AuthorizationType.COGNITO,
+      }
+    )
 
     // /admin/orgs/{orgId}/invites — POST
-    const orgIdResource     = orgsResource.addResource("{orgId}")
     const invitesResource   = orgIdResource.addResource("invites")
     invitesResource.addMethod(
       "POST",
@@ -2041,7 +2161,6 @@ export class BackendStack extends cdk.NestedStack {
     )
 
     // /auth/complete-external-registration — POST
-    const authResource = orgApi.root.addResource("auth")
     const completeRegResource = authResource.addResource("complete-external-registration")
     completeRegResource.addMethod(
       "POST",
