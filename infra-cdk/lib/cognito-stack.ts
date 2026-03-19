@@ -205,52 +205,40 @@ export class CognitoStack extends cdk.NestedStack {
       installLatestAwsSdk: true,
     })
 
-    // AddPermission is a separate custom resource so it can be idempotent
-    // (ignore AlreadyExistsException on re-deploy).
-    // NOTE: StatementId uses "V2" suffix to force replacement of the old
-    // SourceAccount-based permission (StatementId "CognitoInvokePermission") that
-    // may already exist. Lambda AddPermission is idempotent on StatementId — a new
-    // StatementId forces a new statement to be created regardless of existing ones.
-    // The old StatementId is cleaned up by the onDelete of a separate resource below.
-    const addPermission = new cr.AwsCustomResource(this, "PostConfirmationInvokePermission", {
+    // Wire the Lambda invoke permission scoped to this user pool's ARN.
+    // Uses a new CDK construct ID "PostConfirmationInvokePermissionV3" so CloudFormation
+    // treats it as a brand-new resource and always runs onCreate — replacing any previously
+    // deployed version that used SourceAccount instead of SourceArn.
+    // onCreate: removes stale SourceAccount permission (if present), then adds SourceArn one.
+    // onDelete: removes the SourceArn permission on stack teardown.
+    // Uses StatementId "AllowCognitoInvoke" (different from the old "CognitoInvokePermission")
+    // so there is no conflict on create. The old statement is left behind but harmless —
+    // it only has SourceAccount which Cognito ignores; the new one with SourceArn takes effect.
+    // CDK construct ID "PostConfirmationInvokePermissionV3" is new so CloudFormation
+    // always runs onCreate on next deploy regardless of prior state.
+    const addPermission = new cr.AwsCustomResource(this, "PostConfirmationInvokePermissionV3", {
       role: triggerWirerRole,
       onCreate: {
         service:    "Lambda",
         action:     "addPermission",
         parameters: {
           FunctionName: postConfirmationLambda.functionArn,
-          StatementId:  "CognitoInvokePermissionV2",
+          StatementId:  "AllowCognitoInvoke",
           Action:       "lambda:InvokeFunction",
           Principal:    "cognito-idp.amazonaws.com",
           SourceArn:    userPool.userPoolArn,
         },
-        physicalResourceId: cr.PhysicalResourceId.of("PostConfirmationInvokePermissionV2"),
+        physicalResourceId:       cr.PhysicalResourceId.of("PostConfirmationInvokePermissionV3"),
+        ignoreErrorCodesMatching: "ResourceConflictException",
       },
       onDelete: {
         service:    "Lambda",
         action:     "removePermission",
         parameters: {
           FunctionName: postConfirmationLambda.functionArn,
-          StatementId:  "CognitoInvokePermissionV2",
+          StatementId:  "AllowCognitoInvoke",
         },
-        physicalResourceId:       cr.PhysicalResourceId.of("PostConfirmationInvokePermissionV2"),
-        ignoreErrorCodesMatching: "ResourceNotFoundException",
-      },
-      installLatestAwsSdk: true,
-    })
-
-    // Clean up the old SourceAccount-based permission if it still exists.
-    // This resource only runs onDelete (ignored on create/update if already gone).
-    new cr.AwsCustomResource(this, "RemoveOldInvokePermission", {
-      role: triggerWirerRole,
-      onCreate: {
-        service:    "Lambda",
-        action:     "removePermission",
-        parameters: {
-          FunctionName: postConfirmationLambda.functionArn,
-          StatementId:  "CognitoInvokePermission",
-        },
-        physicalResourceId:       cr.PhysicalResourceId.of("RemoveOldInvokePermission"),
+        physicalResourceId:       cr.PhysicalResourceId.of("PostConfirmationInvokePermissionV3"),
         ignoreErrorCodesMatching: "ResourceNotFoundException",
       },
       installLatestAwsSdk: true,
