@@ -2231,14 +2231,72 @@ export class BackendStack extends cdk.NestedStack {
       ],
     }))
 
-    // Bump SeedVersion to force a re-run if seed logic changes.
-    const orgSeedResource = new cdk.CustomResource(this, "OrgSeedResource", {
-      serviceToken: orgSeedLambda.functionArn,
-      properties: { SeedVersion: "1" },
+    // ── IAM role for the AwsCustomResource SDK caller ─────────────────────────
+    // AwsCustomResource needs a dedicated role that can invoke the seed Lambda.
+    // This is separate from the seed Lambda's own execution role.
+    const orgSeedCallerRole = new iam.Role(this, "OrgSeedCallerRole", {
+      assumedBy: new iam.ServicePrincipal("lambda.amazonaws.com"),
+      managedPolicies: [
+        iam.ManagedPolicy.fromAwsManagedPolicyName("service-role/AWSLambdaBasicExecutionRole"),
+      ],
+      inlinePolicies: {
+        InvokeSeedLambda: new iam.PolicyDocument({
+          statements: [
+            new iam.PolicyStatement({
+              actions:   ["lambda:InvokeFunction"],
+              resources: [orgSeedLambda.functionArn],
+            }),
+          ],
+        }),
+      },
+    })
+
+    // ── AwsCustomResource: invoke seed Lambda directly via SDK ─────────────────
+    // Replaces cdk.CustomResource + serviceToken which routes through the CDK
+    // Provider framework — an async polling state machine with a 30-minute
+    // timeout. That framework is what caused the deploy to hang.
+    //
+    // cr.AwsCustomResource calls the Lambda synchronously via the AWS SDK.
+    // Lambda succeeds → CloudFormation marks resource done immediately.
+    // Lambda fails    → CloudFormation fails immediately, deploy stops loudly.
+    //
+    // Bump SeedVersion string to force a re-run when seed logic changes.
+    const orgSeedResource = new cr.AwsCustomResource(this, "OrgSeedResource", {
+      role: orgSeedCallerRole,
+      onCreate: {
+        service:            "Lambda",
+        action:             "invoke",
+        parameters: {
+          FunctionName:   orgSeedLambda.functionArn,
+          InvocationType: "RequestResponse",
+          Payload: JSON.stringify({
+            RequestType:        "Create",
+            SeedVersion:        "1",
+            ResourceProperties: { SeedVersion: "1" },
+          }),
+        },
+        physicalResourceId: cr.PhysicalResourceId.of(`${config.stack_name_base}-org-seed`),
+      },
+      onUpdate: {
+        service:            "Lambda",
+        action:             "invoke",
+        parameters: {
+          FunctionName:   orgSeedLambda.functionArn,
+          InvocationType: "RequestResponse",
+          Payload: JSON.stringify({
+            RequestType:        "Update",
+            SeedVersion:        "1",
+            ResourceProperties: { SeedVersion: "1" },
+          }),
+        },
+        physicalResourceId: cr.PhysicalResourceId.of(`${config.stack_name_base}-org-seed`),
+      },
+      installLatestAwsSdk: true,
     })
 
     orgSeedResource.node.addDependency(orgsTable)
     orgSeedResource.node.addDependency(membershipsTable)
+    orgSeedResource.node.addDependency(orgSeedLambda)
 
     // SSM: store org API URL so frontend can call admin + registration endpoints
     new ssm.StringParameter(this, "OrgApiUrlParam", {
