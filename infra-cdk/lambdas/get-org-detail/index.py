@@ -101,7 +101,7 @@ def handler(event: dict, context: object) -> dict:
     try:
         members_raw = _query_all_pages(
             table=memberships_table,
-            index_name="org-id-index",
+            index_name="org_id-index",
             key_condition=Key("org_id").eq(org_id),
         )
     except Exception as exc:
@@ -112,7 +112,7 @@ def handler(event: dict, context: object) -> dict:
     try:
         invites_raw = _query_all_pages(
             table=invites_table,
-            index_name="org-id-index",
+            index_name="org_id-index",
             key_condition=Key("org_id").eq(org_id),
         )
     except Exception as exc:

@@ -1832,7 +1832,7 @@ export class BackendStack extends cdk.NestedStack {
     })
 
     membershipsTable.addGlobalSecondaryIndex({
-      indexName:     "org-id-index",
+      indexName:     "org_id-index",
       partitionKey:  { name: "org_id",     type: dynamodb.AttributeType.STRING },
       sortKey:       { name: "created_at", type: dynamodb.AttributeType.STRING },
       projectionType: dynamodb.ProjectionType.ALL,
@@ -1861,7 +1861,7 @@ export class BackendStack extends cdk.NestedStack {
 
     // GSI: query all invites for an org (used by get-org-detail admin panel)
     invitesTable.addGlobalSecondaryIndex({
-      indexName:     "org-id-index",
+      indexName:     "org_id-index",
       partitionKey:  { name: "org_id",     type: dynamodb.AttributeType.STRING },
       sortKey:       { name: "created_at", type: dynamodb.AttributeType.STRING },
       projectionType: dynamodb.ProjectionType.ALL,
