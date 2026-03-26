@@ -33,16 +33,15 @@ export class FastMainStack extends cdk.Stack {
       callbackUrls: ["http://localhost:3000", this.amplifyHostingStack.amplifyUrl],
     })
 
-    // Step 3: Backend — needs Cognito IDs, Amplify URL, and the pre-signup Lambda
-    // ARN so it can import the Lambda and wire INVITES_TABLE_NAME + IAM grant
-    // entirely inside BackendStack (avoids circular nested-stack dependency).
+    // Step 3: Backend — needs Cognito IDs and Amplify URL.
+    // IAM grant for pre-signup Lambda is handled inside CognitoStack using a
+    // deterministic table ARN pattern — no cross-stack reference needed.
     this.backendStack = new BackendStack(this, `${id}-backend`, {
-      config:               props.config,
-      userPoolId:           this.cognitoStack.userPoolId,
-      userPoolClientId:     this.cognitoStack.userPoolClientId,
-      userPoolDomain:       this.cognitoStack.userPoolDomain,
-      frontendUrl:          this.amplifyHostingStack.amplifyUrl,
-      preSignupLambdaArn:   this.cognitoStack.preSignupLambdaArn,
+      config:           props.config,
+      userPoolId:       this.cognitoStack.userPoolId,
+      userPoolClientId: this.cognitoStack.userPoolClientId,
+      userPoolDomain:   this.cognitoStack.userPoolDomain,
+      frontendUrl:      this.amplifyHostingStack.amplifyUrl,
     })
 
     new cdk.CfnOutput(this, "AmplifyAppId", {

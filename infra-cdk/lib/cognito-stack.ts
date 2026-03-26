@@ -74,12 +74,31 @@ export class CognitoStack extends cdk.NestedStack {
         removalPolicy: cdk.RemovalPolicy.DESTROY,
       }),
     })
-    // Grant SSM read so the Lambda can fetch the invites table name at runtime
+    // Grant SSM read so the Lambda can fetch the invites table name at runtime.
+    // Grant DynamoDB read on the invites table directly — table name follows a
+    // known pattern so we can construct the ARN without a cross-stack reference.
+    // Table name: ${stack_name_base}-org-invites (set in BackendStack).
     preSignupLambda.addToRolePolicy(new iam.PolicyStatement({
-      effect:    iam.Effect.ALLOW,
-      actions:   ["ssm:GetParameter"],
+      effect:  iam.Effect.ALLOW,
+      actions: ["ssm:GetParameter"],
       resources: [
         `arn:aws:ssm:*:*:parameter/${config.stack_name_base}/rag/invites-table-name`,
+      ],
+    }))
+    preSignupLambda.addToRolePolicy(new iam.PolicyStatement({
+      effect:  iam.Effect.ALLOW,
+      actions: [
+        "dynamodb:GetItem",
+        "dynamodb:Query",
+        "dynamodb:Scan",
+        "dynamodb:BatchGetItem",
+        "dynamodb:ConditionCheckItem",
+        "dynamodb:DescribeTable",
+      ],
+      // Table name is deterministic: set in BackendStack as `${stack_name_base}-org-invites`
+      resources: [
+        `arn:aws:dynamodb:*:*:table/${config.stack_name_base}-org-invites`,
+        `arn:aws:dynamodb:*:*:table/${config.stack_name_base}-org-invites/index/*`,
       ],
     }))
 
