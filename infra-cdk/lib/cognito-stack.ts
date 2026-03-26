@@ -283,8 +283,8 @@ export class CognitoStack extends cdk.NestedStack {
           FunctionName: postConfirmationLambda.functionArn,
           StatementId:  "AllowCognitoInvoke",
         },
-        physicalResourceId:       cr.PhysicalResourceId.of("PostConfirmationInvokePermissionV3"),
-        ignoreErrorCodesMatching: "ResourceNotFoundException",
+        physicalResourceId: cr.PhysicalResourceId.of("PostConfirmationInvokePermissionV3"),
+        ignoreErrorCodesMatching: "ResourceNotFoundException|AccessDeniedException",
       },
       installLatestAwsSdk: true,
     })
@@ -317,14 +317,18 @@ export class CognitoStack extends cdk.NestedStack {
           FunctionName: preSignupLambda.functionArn,
           StatementId:  "AllowCognitoPreSignup",
         },
-        physicalResourceId:       cr.PhysicalResourceId.of("PreSignupInvokePermission"),
-        ignoreErrorCodesMatching: "ResourceNotFoundException",
+        physicalResourceId: cr.PhysicalResourceId.of("PreSignupInvokePermission"),
+        // Suppress both "permission not found" and "IAM not yet propagated" errors
+        // so rollback never gets stuck. The permission either didn't exist (fine)
+        // or the IAM policy hasn't propagated yet (fine — resource is being deleted).
+        ignoreErrorCodesMatching: "ResourceNotFoundException|AccessDeniedException",
       },
       installLatestAwsSdk: true,
     })
 
     preSignupPermission.node.addDependency(preSignupLambda)
     preSignupPermission.node.addDependency(userPool)
+    preSignupPermission.node.addDependency(permissionRole)
 
     // ── COGNITO GROUPS    ──────
     //

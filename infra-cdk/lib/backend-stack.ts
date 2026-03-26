@@ -2299,6 +2299,10 @@ export class BackendStack extends cdk.NestedStack {
       installLatestAwsSdk: true,
     })
 
+    // Explicit dependency on the caller role ensures CloudFormation waits for
+    // the IAM role + inline policy to be fully created before running the
+    // AwsCustomResource — prevents IAM eventual consistency failures.
+    orgSeedResource.node.addDependency(orgSeedCallerRole)
     orgSeedResource.node.addDependency(orgsTable)
     orgSeedResource.node.addDependency(membershipsTable)
     orgSeedResource.node.addDependency(orgSeedLambda)
