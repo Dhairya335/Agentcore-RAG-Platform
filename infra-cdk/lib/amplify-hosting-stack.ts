@@ -88,6 +88,18 @@ export class AmplifyHostingStack extends cdk.NestedStack {
       appName: `${props.config.stack_name_base}-frontend`,
       description: `${props.config.stack_name_base} - React Frontend`,
       platform: amplify.Platform.WEB,
+      // SPA rewrite rule — required for React Router client-side routing.
+      // Without this, Amplify's CDN tries to serve a real file at every path
+      // (e.g. /signup, /admin/orgs) and returns 404 for anything that isn't
+      // a static asset. This rule rewrites all non-asset requests to index.html
+      // so React Router handles the route on the client side.
+      customRules: [
+        {
+          source: "</^[^.]+$|\\.(?!(css|gif|ico|jpg|js|png|txt|svg|woff|woff2|ttf|map|json|webp)$)([^.]+$)/>",
+          target: "/index.html",
+          status: amplify.RedirectStatus.REWRITE,
+        },
+      ],
     })
 
     this.amplifyApp.addBranch("main", {
