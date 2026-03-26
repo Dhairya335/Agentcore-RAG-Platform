@@ -240,29 +240,26 @@ export class CognitoStack extends cdk.NestedStack {
     //
     // StatementId "AllowCognitoInvoke" — clean name, no collision with old IDs.
     // ignoreErrorCodesMatching: ResourceConflictException — safe on re-deploy.
-    const permissionRole = new iam.Role(this, "TriggerWirerRole", {
-      assumedBy: new iam.ServicePrincipal("lambda.amazonaws.com"),
-      managedPolicies: [
-        iam.ManagedPolicy.fromAwsManagedPolicyName("service-role/AWSLambdaBasicExecutionRole"),
-      ],
-      inlinePolicies: {
-        TriggerWirer: new iam.PolicyDocument({
-          statements: [
-            new iam.PolicyStatement({
-              actions:   ["lambda:AddPermission", "lambda:RemovePermission"],
-              // Covers both trigger Lambdas — PostConfirmation and PreSignup
-              resources: [
-                postConfirmationLambda.functionArn,
-                preSignupLambda.functionArn,
-              ],
-            }),
-          ],
-        }),
-      },
-    })
-
+    // ── POST-CONFIRMATION INVOKE PERMISSION ───────────────────────────────────
+    // Grant cognito-idp.amazonaws.com permission to invoke the Lambda via
+    // AwsCustomResource with policy: — this is the ONLY correct CDK pattern.
+    //
+    // Do NOT use `role` + `installLatestAwsSdk: true` together:
+    //   When installLatestAwsSdk is true, CDK creates its own singleton provider
+    //   Lambda with an auto-generated role (AWS679f53fac...) and silently ignores
+    //   the `role` prop. The custom role never gets used, and the provider role
+    //   has no lambda:AddPermission rights → deploy fails with AccessDenied.
+    //
+    // The correct pattern: omit `role` and `installLatestAwsSdk`, and declare
+    // the required permissions via `policy: cr.AwsCustomResourcePolicy.fromStatements`.
+    // CDK attaches these to the auto-created provider role automatically.
     const addPermission = new cr.AwsCustomResource(this, "PostConfirmationInvokePermissionV3", {
-      role: permissionRole,
+      policy: cr.AwsCustomResourcePolicy.fromStatements([
+        new iam.PolicyStatement({
+          actions:   ["lambda:AddPermission", "lambda:RemovePermission"],
+          resources: [postConfirmationLambda.functionArn],
+        }),
+      ]),
       onCreate: {
         service:    "Lambda",
         action:     "addPermission",
@@ -283,20 +280,25 @@ export class CognitoStack extends cdk.NestedStack {
           FunctionName: postConfirmationLambda.functionArn,
           StatementId:  "AllowCognitoInvoke",
         },
-        physicalResourceId: cr.PhysicalResourceId.of("PostConfirmationInvokePermissionV3"),
+        physicalResourceId:       cr.PhysicalResourceId.of("PostConfirmationInvokePermissionV3"),
         ignoreErrorCodesMatching: "ResourceNotFoundException|AccessDeniedException",
       },
-      installLatestAwsSdk: true,
     })
 
     addPermission.node.addDependency(postConfirmationLambda)
     addPermission.node.addDependency(userPool)
 
     // ── PRE-SIGNUP INVOKE PERMISSION ──────────────────────────────────────────
-    // Same pattern as PostConfirmation invoke permission above.
-    // StatementId must be unique per Lambda function — "AllowCognitoPreSignup".
+    // Same pattern as PostConfirmation above — policy: grants the auto-created
+    // provider role AddPermission/RemovePermission on the pre-signup Lambda.
+    // StatementId must be unique per Lambda — "AllowCognitoPreSignup".
     const preSignupPermission = new cr.AwsCustomResource(this, "PreSignupInvokePermission", {
-      role: permissionRole,
+      policy: cr.AwsCustomResourcePolicy.fromStatements([
+        new iam.PolicyStatement({
+          actions:   ["lambda:AddPermission", "lambda:RemovePermission"],
+          resources: [preSignupLambda.functionArn],
+        }),
+      ]),
       onCreate: {
         service:    "Lambda",
         action:     "addPermission",
@@ -317,18 +319,13 @@ export class CognitoStack extends cdk.NestedStack {
           FunctionName: preSignupLambda.functionArn,
           StatementId:  "AllowCognitoPreSignup",
         },
-        physicalResourceId: cr.PhysicalResourceId.of("PreSignupInvokePermission"),
-        // Suppress both "permission not found" and "IAM not yet propagated" errors
-        // so rollback never gets stuck. The permission either didn't exist (fine)
-        // or the IAM policy hasn't propagated yet (fine — resource is being deleted).
+        physicalResourceId:       cr.PhysicalResourceId.of("PreSignupInvokePermission"),
         ignoreErrorCodesMatching: "ResourceNotFoundException|AccessDeniedException",
       },
-      installLatestAwsSdk: true,
     })
 
     preSignupPermission.node.addDependency(preSignupLambda)
     preSignupPermission.node.addDependency(userPool)
-    preSignupPermission.node.addDependency(permissionRole)
 
     // ── COGNITO GROUPS    ──────
     //

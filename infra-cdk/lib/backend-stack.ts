@@ -2236,38 +2236,21 @@ export class BackendStack extends cdk.NestedStack {
       ],
     }))
 
-    // ── IAM role for the AwsCustomResource SDK caller ─────────────────────────
-    // AwsCustomResource needs a dedicated role that can invoke the seed Lambda.
-    // This is separate from the seed Lambda's own execution role.
-    const orgSeedCallerRole = new iam.Role(this, "OrgSeedCallerRole", {
-      assumedBy: new iam.ServicePrincipal("lambda.amazonaws.com"),
-      managedPolicies: [
-        iam.ManagedPolicy.fromAwsManagedPolicyName("service-role/AWSLambdaBasicExecutionRole"),
-      ],
-      inlinePolicies: {
-        InvokeSeedLambda: new iam.PolicyDocument({
-          statements: [
-            new iam.PolicyStatement({
-              actions:   ["lambda:InvokeFunction"],
-              resources: [orgSeedLambda.functionArn],
-            }),
-          ],
-        }),
-      },
-    })
-
     // ── AwsCustomResource: invoke seed Lambda directly via SDK ─────────────────
-    // Replaces cdk.CustomResource + serviceToken which routes through the CDK
-    // Provider framework — an async polling state machine with a 30-minute
-    // timeout. That framework is what caused the deploy to hang.
-    //
     // cr.AwsCustomResource calls the Lambda synchronously via the AWS SDK.
     // Lambda succeeds → CloudFormation marks resource done immediately.
     // Lambda fails    → CloudFormation fails immediately, deploy stops loudly.
     //
+    // IMPORTANT: Do NOT set `role` or `installLatestAwsSdk: true`.
+    // When installLatestAwsSdk is true, CDK uses its own singleton provider
+    // Lambda with an auto-generated role (AWS679f53fac...) and ignores `role`.
+    // Without installLatestAwsSdk, CDK uses a simpler inline provider that
+    // respects the `role` prop — but the simplest correct approach is to
+    // let CDK auto-create the provider role and then grant invoke on it via
+    // orgSeedLambda.grantInvoke(orgSeedResource.grantPrincipal).
+    //
     // Bump SeedVersion string to force a re-run when seed logic changes.
     const orgSeedResource = new cr.AwsCustomResource(this, "OrgSeedResource", {
-      role: orgSeedCallerRole,
       onCreate: {
         service:            "Lambda",
         action:             "invoke",
@@ -2296,13 +2279,17 @@ export class BackendStack extends cdk.NestedStack {
         },
         physicalResourceId: cr.PhysicalResourceId.of(`${config.stack_name_base}-org-seed`),
       },
-      installLatestAwsSdk: true,
+      // policy: grants the auto-created provider role permission to invoke the seed Lambda.
+      // This is the correct CDK pattern — AwsCustomResource.grantPrincipal is the
+      // provider Lambda's execution role, which is what actually makes the SDK call.
+      policy: cr.AwsCustomResourcePolicy.fromStatements([
+        new iam.PolicyStatement({
+          actions:   ["lambda:InvokeFunction"],
+          resources: [orgSeedLambda.functionArn],
+        }),
+      ]),
     })
 
-    // Explicit dependency on the caller role ensures CloudFormation waits for
-    // the IAM role + inline policy to be fully created before running the
-    // AwsCustomResource — prevents IAM eventual consistency failures.
-    orgSeedResource.node.addDependency(orgSeedCallerRole)
     orgSeedResource.node.addDependency(orgsTable)
     orgSeedResource.node.addDependency(membershipsTable)
     orgSeedResource.node.addDependency(orgSeedLambda)
