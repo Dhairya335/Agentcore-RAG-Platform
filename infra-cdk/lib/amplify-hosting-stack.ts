@@ -180,7 +180,7 @@ export class AmplifyHostingStack extends cdk.NestedStack {
         ZipKey:         "frontend/frontend-build.zip",
         StackName:      props.config.stack_name_base,
         AmplifyUrl:     this.amplifyUrl,
-        DeployVersion:  "2",
+        DeployVersion:  "3",
       },
     })
 
