@@ -42,6 +42,18 @@ export class FastMainStack extends cdk.Stack {
       frontendUrl:      this.amplifyHostingStack.amplifyUrl,
     })
 
+    // ── Cross-stack wiring: pre-signup Lambda → InvitesTable ──────────────────
+    // CognitoStack is created before BackendStack (step 2 vs step 3 above), so
+    // InvitesTable does not exist when CognitoStack is instantiated.
+    // We wire the dependency here — after both stacks exist — by:
+    //   a) Setting INVITES_TABLE_NAME on the pre-signup Lambda
+    //   b) Granting DynamoDB read access so the Lambda can query the GSI
+    this.cognitoStack.preSignupLambda.addEnvironment(
+      "INVITES_TABLE_NAME",
+      this.backendStack.invitesTable.tableName
+    )
+    this.backendStack.invitesTable.grantReadData(this.cognitoStack.preSignupLambda)
+
     new cdk.CfnOutput(this, "AmplifyAppId", {
       value:       this.amplifyHostingStack.amplifyApp.appId,
       description: "Amplify App ID",

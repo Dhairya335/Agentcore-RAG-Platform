@@ -40,6 +40,9 @@ export class BackendStack extends cdk.NestedStack {
   public docsApiUrl: string
   public runtimeArn: string
   public memoryArn: string
+  // Exposed so fast-main-stack.ts can grant the pre-signup Lambda read access
+  // after both CognitoStack and BackendStack are instantiated.
+  public invitesTable: dynamodb.Table
   private agentName: cdk.CfnParameter
   private networkMode: cdk.CfnParameter
   private userPool: cognito.IUserPool
@@ -1866,6 +1869,21 @@ export class BackendStack extends cdk.NestedStack {
       sortKey:       { name: "created_at", type: dynamodb.AttributeType.STRING },
       projectionType: dynamodb.ProjectionType.ALL,
     })
+
+    // GSI: query invites by email — used by pre-signup Lambda to validate that
+    // a registering email has a valid pending invite before allowing sign-up.
+    // CloudFormation only allows one GSI add per update — this is the second GSI
+    // on this table. Deploy in a separate update if InvitesTable already has
+    // org_id-index from a prior deploy.
+    invitesTable.addGlobalSecondaryIndex({
+      indexName:      "invited_email-index",
+      partitionKey:   { name: "invited_email", type: dynamodb.AttributeType.STRING },
+      sortKey:        { name: "expires_at",    type: dynamodb.AttributeType.NUMBER },
+      projectionType: dynamodb.ProjectionType.ALL,
+    })
+
+    // Expose so fast-main-stack.ts can grant the pre-signup Lambda read access
+    this.invitesTable = invitesTable
 
     new ssm.StringParameter(this, "InvitesTableParam", {
       parameterName: `/${config.stack_name_base}/rag/invites-table-name`,

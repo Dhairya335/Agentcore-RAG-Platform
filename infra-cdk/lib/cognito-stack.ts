@@ -17,6 +17,9 @@ export class CognitoStack extends cdk.NestedStack {
   public userPoolId: string
   public userPoolClientId: string
   public userPoolDomain: cognito.UserPoolDomain
+  // Exposed so fast-main-stack.ts can grant DynamoDB read access and set
+  // INVITES_TABLE_NAME env var after BackendStack is instantiated.
+  public preSignupLambda: lambda.Function
 
   constructor(scope: Construct, id: string, props: CognitoStackProps) {
     super(scope, id, props)
@@ -27,6 +30,41 @@ export class CognitoStack extends cdk.NestedStack {
   private createCognitoUserPool(config: AppConfig, callbackUrls?: string[]): void {
     const defaultCallbackUrls = ["http://localhost:3000", "https://localhost:3000"]
     const finalCallbackUrls = callbackUrls || defaultCallbackUrls
+
+    // ── PRE-SIGNUP LAMBDA TRIGGER ─────────────────────────────────────────────
+    // Fires synchronously BEFORE a new Cognito account is created.
+    // Blocks sign-up unless the registering email has a valid PENDING unexpired
+    // invite in the invites table — enforcing invite-only external onboarding.
+    //
+    // INVITES_TABLE_NAME env var is intentionally left empty here. It cannot be
+    // set at this point because InvitesTable lives in BackendStack, which is
+    // created AFTER CognitoStack in fast-main-stack.ts. fast-main-stack.ts calls
+    // preSignupLambda.addEnvironment("INVITES_TABLE_NAME", ...) after both
+    // stacks are instantiated, and also grants DynamoDB read access.
+    //
+    // Fail closed: if the Lambda raises an exception, Cognito blocks sign-up.
+    // AdminCreateUser flows (internal/CDK users) fire PreSignUp_AdminCreateUser
+    // which is skipped by the Lambda — internal users are never blocked.
+    this.preSignupLambda = new lambda.Function(this, "PreSignupLambda", {
+      functionName: `${config.stack_name_base}-pre-signup`,
+      runtime:      lambda.Runtime.PYTHON_3_13,
+      handler:      "index.handler",
+      code:         lambda.Code.fromAsset(
+        path.join(__dirname, "..", "lambdas", "pre-signup")
+      ),
+      architecture: lambda.Architecture.ARM_64,
+      timeout:      cdk.Duration.seconds(10),
+      memorySize:   128,
+      environment: {
+        // INVITES_TABLE_NAME is set by fast-main-stack.ts after BackendStack exists
+        INVITES_TABLE_NAME: "PENDING",
+      },
+      logGroup: new logs.LogGroup(this, "PreSignupLogGroup", {
+        logGroupName:  `/aws/lambda/${config.stack_name_base}-pre-signup`,
+        retention:     logs.RetentionDays.ONE_WEEK,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      }),
+    })
 
     // ── POST-CONFIRMATION LAMBDA TRIGGER    ──────
     // Fires after a user self-registers and confirms their email.
@@ -143,7 +181,14 @@ export class CognitoStack extends cdk.NestedStack {
       "LambdaConfig.PostConfirmation",
       postConfirmationLambda.functionArn
     )
+    // Wire pre-signup trigger — same escape hatch pattern as PostConfirmation.
+    // PreSignUp fires before account creation; raising in the Lambda blocks sign-up.
+    cfnUserPool.addPropertyOverride(
+      "LambdaConfig.PreSignUp",
+      this.preSignupLambda.functionArn
+    )
     cfnUserPool.node.addDependency(postConfirmationLambda)
+    cfnUserPool.node.addDependency(this.preSignupLambda)
 
     // ── LAMBDA INVOKE PERMISSION  ──────
     //
@@ -166,7 +211,11 @@ export class CognitoStack extends cdk.NestedStack {
           statements: [
             new iam.PolicyStatement({
               actions:   ["lambda:AddPermission", "lambda:RemovePermission"],
-              resources: [postConfirmationLambda.functionArn],
+              // Covers both trigger Lambdas — PostConfirmation and PreSignup
+              resources: [
+                postConfirmationLambda.functionArn,
+                this.preSignupLambda.functionArn,
+              ],
             }),
           ],
         }),
@@ -203,6 +252,40 @@ export class CognitoStack extends cdk.NestedStack {
 
     addPermission.node.addDependency(postConfirmationLambda)
     addPermission.node.addDependency(userPool)
+
+    // ── PRE-SIGNUP INVOKE PERMISSION ──────────────────────────────────────────
+    // Same pattern as PostConfirmation invoke permission above.
+    // StatementId must be unique per Lambda function — "AllowCognitoPreSignup".
+    const preSignupPermission = new cr.AwsCustomResource(this, "PreSignupInvokePermission", {
+      role: permissionRole,
+      onCreate: {
+        service:    "Lambda",
+        action:     "addPermission",
+        parameters: {
+          FunctionName: this.preSignupLambda.functionArn,
+          StatementId:  "AllowCognitoPreSignup",
+          Action:       "lambda:InvokeFunction",
+          Principal:    "cognito-idp.amazonaws.com",
+          SourceArn:    userPool.userPoolArn,
+        },
+        physicalResourceId:       cr.PhysicalResourceId.of("PreSignupInvokePermission"),
+        ignoreErrorCodesMatching: "ResourceConflictException",
+      },
+      onDelete: {
+        service:    "Lambda",
+        action:     "removePermission",
+        parameters: {
+          FunctionName: this.preSignupLambda.functionArn,
+          StatementId:  "AllowCognitoPreSignup",
+        },
+        physicalResourceId:       cr.PhysicalResourceId.of("PreSignupInvokePermission"),
+        ignoreErrorCodesMatching: "ResourceNotFoundException",
+      },
+      installLatestAwsSdk: true,
+    })
+
+    preSignupPermission.node.addDependency(this.preSignupLambda)
+    preSignupPermission.node.addDependency(userPool)
 
     // ── COGNITO GROUPS    ──────
     //
