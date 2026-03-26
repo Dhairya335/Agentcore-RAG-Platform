@@ -17,9 +17,11 @@ export class CognitoStack extends cdk.NestedStack {
   public userPoolId: string
   public userPoolClientId: string
   public userPoolDomain: cognito.UserPoolDomain
-  // Exposed so fast-main-stack.ts can grant DynamoDB read access and set
-  // INVITES_TABLE_NAME env var after BackendStack is instantiated.
-  public preSignupLambda: lambda.Function
+  // Exposed as ARN string (not the Function object) so BackendStack can import
+  // the Lambda and grant DynamoDB read access without creating a circular
+  // nested-stack dependency. BackendStack uses lambda.Function.fromFunctionArn()
+  // to get an IFunction reference scoped to BackendStack, then calls grantReadData.
+  public preSignupLambdaArn: string
 
   constructor(scope: Construct, id: string, props: CognitoStackProps) {
     super(scope, id, props)
@@ -45,7 +47,11 @@ export class CognitoStack extends cdk.NestedStack {
     // Fail closed: if the Lambda raises an exception, Cognito blocks sign-up.
     // AdminCreateUser flows (internal/CDK users) fire PreSignUp_AdminCreateUser
     // which is skipped by the Lambda — internal users are never blocked.
-    this.preSignupLambda = new lambda.Function(this, "PreSignupLambda", {
+    // Local variable used for trigger wiring below. ARN is exposed via
+    // this.preSignupLambdaArn so BackendStack can import it without a circular dep.
+    // INVITES_TABLE_NAME starts as placeholder — BackendStack calls addEnvironment
+    // on the imported IFunction reference after the table is created.
+    const preSignupLambda = new lambda.Function(this, "PreSignupLambda", {
       functionName: `${config.stack_name_base}-pre-signup`,
       runtime:      lambda.Runtime.PYTHON_3_13,
       handler:      "index.handler",
@@ -56,8 +62,11 @@ export class CognitoStack extends cdk.NestedStack {
       timeout:      cdk.Duration.seconds(10),
       memorySize:   128,
       environment: {
-        // INVITES_TABLE_NAME is set by fast-main-stack.ts after BackendStack exists
-        INVITES_TABLE_NAME: "PENDING",
+        // SSM parameter path where BackendStack writes the invites table name.
+        // The Lambda reads the actual table name from SSM at runtime — avoids
+        // a circular nested-stack dependency (CognitoStack ↔ BackendStack).
+        // BackendStack writes: /{stack_name_base}/rag/invites-table-name
+        INVITES_TABLE_SSM_PARAM: `/${config.stack_name_base}/rag/invites-table-name`,
       },
       logGroup: new logs.LogGroup(this, "PreSignupLogGroup", {
         logGroupName:  `/aws/lambda/${config.stack_name_base}-pre-signup`,
@@ -65,6 +74,17 @@ export class CognitoStack extends cdk.NestedStack {
         removalPolicy: cdk.RemovalPolicy.DESTROY,
       }),
     })
+    // Grant SSM read so the Lambda can fetch the invites table name at runtime
+    preSignupLambda.addToRolePolicy(new iam.PolicyStatement({
+      effect:    iam.Effect.ALLOW,
+      actions:   ["ssm:GetParameter"],
+      resources: [
+        `arn:aws:ssm:*:*:parameter/${config.stack_name_base}/rag/invites-table-name`,
+      ],
+    }))
+
+    // Expose the ARN as a plain string — BackendStack imports this as IFunction
+    this.preSignupLambdaArn = preSignupLambda.functionArn
 
     // ── POST-CONFIRMATION LAMBDA TRIGGER    ──────
     // Fires after a user self-registers and confirms their email.
@@ -185,10 +205,10 @@ export class CognitoStack extends cdk.NestedStack {
     // PreSignUp fires before account creation; raising in the Lambda blocks sign-up.
     cfnUserPool.addPropertyOverride(
       "LambdaConfig.PreSignUp",
-      this.preSignupLambda.functionArn
+      preSignupLambda.functionArn
     )
     cfnUserPool.node.addDependency(postConfirmationLambda)
-    cfnUserPool.node.addDependency(this.preSignupLambda)
+    cfnUserPool.node.addDependency(preSignupLambda)
 
     // ── LAMBDA INVOKE PERMISSION  ──────
     //
@@ -214,7 +234,7 @@ export class CognitoStack extends cdk.NestedStack {
               // Covers both trigger Lambdas — PostConfirmation and PreSignup
               resources: [
                 postConfirmationLambda.functionArn,
-                this.preSignupLambda.functionArn,
+                preSignupLambda.functionArn,
               ],
             }),
           ],
@@ -262,7 +282,7 @@ export class CognitoStack extends cdk.NestedStack {
         service:    "Lambda",
         action:     "addPermission",
         parameters: {
-          FunctionName: this.preSignupLambda.functionArn,
+          FunctionName: preSignupLambda.functionArn,
           StatementId:  "AllowCognitoPreSignup",
           Action:       "lambda:InvokeFunction",
           Principal:    "cognito-idp.amazonaws.com",
@@ -275,7 +295,7 @@ export class CognitoStack extends cdk.NestedStack {
         service:    "Lambda",
         action:     "removePermission",
         parameters: {
-          FunctionName: this.preSignupLambda.functionArn,
+          FunctionName: preSignupLambda.functionArn,
           StatementId:  "AllowCognitoPreSignup",
         },
         physicalResourceId:       cr.PhysicalResourceId.of("PreSignupInvokePermission"),
@@ -284,7 +304,7 @@ export class CognitoStack extends cdk.NestedStack {
       installLatestAwsSdk: true,
     })
 
-    preSignupPermission.node.addDependency(this.preSignupLambda)
+    preSignupPermission.node.addDependency(preSignupLambda)
     preSignupPermission.node.addDependency(userPool)
 
     // ── COGNITO GROUPS    ──────

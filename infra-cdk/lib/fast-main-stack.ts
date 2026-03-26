@@ -33,26 +33,17 @@ export class FastMainStack extends cdk.Stack {
       callbackUrls: ["http://localhost:3000", this.amplifyHostingStack.amplifyUrl],
     })
 
-    // Step 3: Backend — needs Cognito IDs and Amplify URL
+    // Step 3: Backend — needs Cognito IDs, Amplify URL, and the pre-signup Lambda
+    // ARN so it can import the Lambda and wire INVITES_TABLE_NAME + IAM grant
+    // entirely inside BackendStack (avoids circular nested-stack dependency).
     this.backendStack = new BackendStack(this, `${id}-backend`, {
-      config: props.config,
-      userPoolId:       this.cognitoStack.userPoolId,
-      userPoolClientId: this.cognitoStack.userPoolClientId,
-      userPoolDomain:   this.cognitoStack.userPoolDomain,
-      frontendUrl:      this.amplifyHostingStack.amplifyUrl,
+      config:               props.config,
+      userPoolId:           this.cognitoStack.userPoolId,
+      userPoolClientId:     this.cognitoStack.userPoolClientId,
+      userPoolDomain:       this.cognitoStack.userPoolDomain,
+      frontendUrl:          this.amplifyHostingStack.amplifyUrl,
+      preSignupLambdaArn:   this.cognitoStack.preSignupLambdaArn,
     })
-
-    // ── Cross-stack wiring: pre-signup Lambda → InvitesTable ──────────────────
-    // CognitoStack is created before BackendStack (step 2 vs step 3 above), so
-    // InvitesTable does not exist when CognitoStack is instantiated.
-    // We wire the dependency here — after both stacks exist — by:
-    //   a) Setting INVITES_TABLE_NAME on the pre-signup Lambda
-    //   b) Granting DynamoDB read access so the Lambda can query the GSI
-    this.cognitoStack.preSignupLambda.addEnvironment(
-      "INVITES_TABLE_NAME",
-      this.backendStack.invitesTable.tableName
-    )
-    this.backendStack.invitesTable.grantReadData(this.cognitoStack.preSignupLambda)
 
     new cdk.CfnOutput(this, "AmplifyAppId", {
       value:       this.amplifyHostingStack.amplifyApp.appId,

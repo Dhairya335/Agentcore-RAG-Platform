@@ -30,6 +30,10 @@ export interface BackendStackProps extends cdk.NestedStackProps {
   userPoolClientId: string
   userPoolDomain: cognito.UserPoolDomain
   frontendUrl: string
+  // ARN of the pre-signup Lambda (created in CognitoStack). Passed as a plain
+  // string so BackendStack can import it via fromFunctionArn() and wire
+  // INVITES_TABLE_NAME + IAM grant without creating a circular nested-stack dep.
+  preSignupLambdaArn: string
 }
 
 export class BackendStack extends cdk.NestedStack {
@@ -120,7 +124,7 @@ export class BackendStack extends cdk.NestedStack {
 
     // Phase 4: Org-level tenancy — DynamoDB tables (orgs, memberships, invites)
     //           + admin API routes + complete-registration endpoint
-    this.createOrgTenancyInfra(props.config, props.frontendUrl)
+    this.createOrgTenancyInfra(props.config, props.frontendUrl, props.preSignupLambdaArn)
 
   }
 
@@ -1799,7 +1803,7 @@ export class BackendStack extends cdk.NestedStack {
   //  presign-upload and ingestion-worker already get MEMBERSHIPS_TABLE_NAME
   //  injected via their own environment blocks above.
   // ═══════════════════════════════════════════════════════════════════════════
-  private createOrgTenancyInfra(config: AppConfig, frontendUrl: string): void {
+  private createOrgTenancyInfra(config: AppConfig, frontendUrl: string, preSignupLambdaArn: string): void {
 
     // ── 1. DynamoDB: fast_orgs  ───────
     // Stores one record per organisation.
@@ -1882,8 +1886,22 @@ export class BackendStack extends cdk.NestedStack {
       projectionType: dynamodb.ProjectionType.ALL,
     })
 
-    // Expose so fast-main-stack.ts can grant the pre-signup Lambda read access
     this.invitesTable = invitesTable
+
+    // ── Wire pre-signup Lambda → InvitesTable ─────────────────────────────────
+    // Import the pre-signup Lambda (lives in CognitoStack) by ARN so we can:
+    //   a) Set INVITES_TABLE_NAME env var on it
+    //   b) Grant it DynamoDB read access
+    // Using fromFunctionArn() scopes the import to BackendStack — no cross-stack
+    // object reference, so no circular nested-stack dependency in CloudFormation.
+    const preSignupLambdaRef = lambda.Function.fromFunctionArn(
+      this,
+      "ImportedPreSignupLambda",
+      preSignupLambdaArn
+    )
+    // Grant read access — the Lambda looks up the table name via SSM at runtime
+    // (INVITES_TABLE_SSM_PARAM env var) to avoid circular cross-stack env var wiring.
+    invitesTable.grantReadData(preSignupLambdaRef)
 
     new ssm.StringParameter(this, "InvitesTableParam", {
       parameterName: `/${config.stack_name_base}/rag/invites-table-name`,
