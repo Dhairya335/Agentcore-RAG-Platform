@@ -191,7 +191,7 @@ export default function OrgDetailPage() {
           </div>
         )}
 
-        {/* ── Invite section ──────────────────────────────────────────────── */}
+        {/* ── Invite section  ─────── */}
         <div className="bg-white rounded-xl border shadow-sm overflow-hidden">
           <div className="px-5 py-4 border-b flex items-center gap-2">
             <Link2 className="h-4 w-4 text-blue-500" />
@@ -305,7 +305,7 @@ export default function OrgDetailPage() {
           </div>
         </div>
 
-        {/* ── Members section ─────────────────────────────────────────────── */}
+        {/* ── Members section  ────── */}
         <div className="bg-white rounded-xl border shadow-sm overflow-hidden">
           <div className="px-5 py-4 border-b flex items-center gap-2">
             <Users className="h-4 w-4 text-blue-500" />

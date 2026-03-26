@@ -26,7 +26,7 @@ async function loadOrgApiBase(): Promise<string> {
   return ORG_API_BASE
 }
 
-// ── Session Context ────────────────────────────────────────────────────────────
+// ── Session Context      ─
 
 export type RoleClass        = "INTERNAL" | "EXTERNAL"
 export type MembershipStatus = "ACTIVE" | "MISSING"
@@ -67,7 +67,7 @@ export async function getSessionContext(idToken: string): Promise<SessionContext
   return resp.json() as Promise<SessionContext>
 }
 
-// ── Org Management ─────────────────────────────────────────────────────────────
+// ── Org Management      ──
 
 export type OrgType = "CLIENT" | "INTERNAL_VENDOR" | "PERSONAL_FUTURE"
 
@@ -161,7 +161,7 @@ export async function createOrg(
   return resp.json() as Promise<OrgSummary>
 }
 
-// ── Invite Management ──────────────────────────────────────────────────────────
+// ── Invite Management       
 
 export interface CreateInviteRequest {
   invitedEmail: string
@@ -200,7 +200,7 @@ export async function createInvite(
   return resp.json() as Promise<CreateInviteResponse>
 }
 
-// ── Registration ───────────────────────────────────────────────────────────────
+// ── Registration      ────
 
 export interface CompleteRegistrationResponse {
   orgId:   string

@@ -101,7 +101,7 @@ def handler(event: dict, context: object) -> dict:
     if not invited_email or "@" not in invited_email:
         return _error(400, "invitedEmail is required and must be a valid email address", event)
 
-    # ── Validate org exists and is ACTIVE ─────────────────────────────────────
+    # ── Validate org exists and is ACTIVE    ─────
     orgs_table = dynamodb.Table(ORGS_TABLE_NAME)
     try:
         org_resp = orgs_table.get_item(
@@ -118,7 +118,7 @@ def handler(event: dict, context: object) -> dict:
     if org.get("status") != "ACTIVE":
         return _error(400, f"Organisation '{org_id}' is not ACTIVE (status={org.get('status')})", event)
 
-    # ── Generate invite token ─────────────────────────────────────────────────
+    # ── Generate invite token     
     # 32 bytes = 256-bit entropy. Only the SHA-256 hash is stored; the raw
     # token is returned once and never persisted anywhere.
     raw_token:  str = secrets.token_hex(32)
@@ -129,7 +129,7 @@ def handler(event: dict, context: object) -> dict:
     expires_at:    datetime = now + timedelta(days=INVITE_TTL_DAYS)
     expires_epoch: int      = int(expires_at.timestamp())   # DynamoDB TTL uses Unix epoch seconds
 
-    # ── Write invite record (hash only) ──────────────────────────────────────
+    # ── Write invite record (hash only)    ──────
     invites_table = dynamodb.Table(INVITES_TABLE_NAME)
     try:
         invites_table.put_item(

@@ -24,7 +24,7 @@ import {
 import { useAuth as useOidcAuth } from "react-oidc-context"
 import { getSessionContext, type SessionContext } from "@/services/sessionService"
 
-// ── Types ──────────────────────────────────────────────────────────────────────
+// ── Types   ──────
 
 interface SessionState {
   loading:         boolean
@@ -34,7 +34,7 @@ interface SessionState {
   refreshSession:  () => Promise<void>
 }
 
-// ── Context ────────────────────────────────────────────────────────────────────
+// ── Context   ────
 
 const SessionCtx = createContext<SessionState | undefined>(undefined)
 
@@ -44,7 +44,7 @@ export function useSession(): SessionState {
   return ctx
 }
 
-// ── Convenience selectors ──────────────────────────────────────────────────────
+// ── Convenience selectors    ────
 
 /** True only for INTERNAL+ACTIVE users */
 export function useIsInternal(): boolean {
@@ -69,7 +69,7 @@ export function useCapabilities() {
   }
 }
 
-// ── Provider ───────────────────────────────────────────────────────────────────
+// ── Provider   ───
 
 export function SessionBootstrapProvider({ children }: PropsWithChildren) {
   const auth = useOidcAuth()

@@ -289,7 +289,7 @@ function _sleep(ms: number, signal?: AbortSignal): Promise<void> {
   })
 }
 
-// ── Phase 3.1 — Document Library ─────────────────────────────────────────────
+// ── Phase 3.1 — Document Library  ────
 
 export interface DocumentListItem {
   docId:         string
@@ -336,7 +336,7 @@ export async function listDocuments(
   return resp.json() as Promise<DocumentListResponse>
 }
 
-// ── Phase 3.2 — Document Detail ───────────────────────────────────────────────
+// ── Phase 3.2 — Document Detail  ──────
 
 export interface DocumentDetail {
   docId:         string

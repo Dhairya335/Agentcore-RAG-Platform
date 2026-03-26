@@ -39,12 +39,12 @@ _cors_list = [o.strip() for o in CORS_ALLOWED_ORIGINS.split(",") if o.strip()]
 
 
 def handler(event, context):
-    # ── RBAC: internal only ──────────────────────────────────────────────────
+    # ── RBAC: internal only    
     role = _extract_role(event)
     if role != "INTERNAL":
         return _error(403, "Document detail access requires INTERNAL role", event)
 
-    # ── Input ────────────────────────────────────────────────────────────────
+    # ── Input   
     path_params  = event.get("pathParameters") or {}
     query_params = event.get("queryStringParameters") or {}
 
@@ -58,7 +58,7 @@ def handler(event, context):
 
     pk = f"TENANT#{tenant_id}#DOC#{doc_id}"
 
-    # ── BatchGetItem: LATEST + VER#000001 in one round-trip ─────────────────
+    # ── BatchGetItem: LATEST + VER#000001 in one round-trip      
     # We always read version 1 for creation metadata (createdAt, contentType, s3Key).
     # LATEST gives us current status, chunkCount, latestVersion.
     # Future: accept ?version= param to read a specific VER record.
@@ -95,7 +95,7 @@ def handler(event, context):
     if not latest and not ver1:
         return _error(404, f"Document not found: {doc_id}", event)
 
-    # ── Shape response ───────────────────────────────────────────────────────
+    # ── Shape response    ─────
     def _s(item, key):  return item.get(key, {}).get("S")
     def _n(item, key):  return int(item.get(key, {}).get("N", 0)) if key in item else None
 
@@ -126,7 +126,7 @@ def handler(event, context):
     }
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# ── Helpers   ──
 
 def _extract_role(event: dict) -> str:
     """Extract role from Cognito JWT claims injected by API Gateway authorizer."""

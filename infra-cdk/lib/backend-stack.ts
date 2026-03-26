@@ -993,7 +993,7 @@ export class BackendStack extends cdk.NestedStack {
       }
     )
 
-    // ── Phase 3.1: GET /documents — List all documents for a tenant ──────────
+    // ── Phase 3.1: GET /documents — List all documents for a tenant   ─
     // INTERNAL role only (enforced at Lambda level via Cognito JWT groups claim).
     // Queries GSI tenantId-updatedAt-index on LATEST records only.
     // LATEST records carry denormalized status + chunkCount (written by ingestion-worker).
@@ -1035,7 +1035,7 @@ export class BackendStack extends cdk.NestedStack {
       }
     )
 
-    // ── Phase 3.2: GET /documents/{docId} — Full document detail ─────────────
+    // ── Phase 3.2: GET /documents/{docId} — Full document detail   ────
     // INTERNAL role only. BatchGetItem on LATEST + VER#000001 in one round-trip.
     // docItemResource already created above for /documents/{docId}/status
     const getDocumentLambda = new lambda.Function(this, "GetDocumentLambda", {
@@ -1798,7 +1798,7 @@ export class BackendStack extends cdk.NestedStack {
   // ═══════════════════════════════════════════════════════════════════════════
   private createOrgTenancyInfra(config: AppConfig, frontendUrl: string): void {
 
-    // ── 1. DynamoDB: fast_orgs ────────────────────────────────────────────────
+    // ── 1. DynamoDB: fast_orgs  ───────
     // Stores one record per organisation.
     // org_id = "org-internal" for the vendor org (created by backfill script).
     // External orgs get org_id = "{slug}-{6-char uuid}" (set by create-org Lambda).
@@ -1818,7 +1818,7 @@ export class BackendStack extends cdk.NestedStack {
       description:   "DynamoDB table for org registry (Phase 4)",
     })
 
-    // ── 2. DynamoDB: fast_user_memberships ────────────────────────────────────
+    // ── 2. DynamoDB: fast_user_memberships    ────
     // Authoritative source of truth: user_sub → org_id mapping.
     // Every authorization-critical Lambda does a strongly consistent GetItem here.
     // GSI on org_id allows listing all members of an org (admin use case).
@@ -1844,7 +1844,7 @@ export class BackendStack extends cdk.NestedStack {
       description:   "DynamoDB table for user→org membership (Phase 4)",
     })
 
-    // ── 3. DynamoDB: fast_org_invites ─────────────────────────────────────────
+    // ── 3. DynamoDB: fast_org_invites  
     // Invite tokens stored as SHA-256 hash (never raw).
     // TTL enabled so expired invites auto-purge after 7 days.
     // PK = token_hash (SHA-256 hex string).
@@ -1873,7 +1873,7 @@ export class BackendStack extends cdk.NestedStack {
       description:   "DynamoDB table for org invite tokens (Phase 4)",
     })
 
-    // ── 4. Lambda: create-org ─────────────────────────────────────────────────
+    // ── 4. Lambda: create-org     
     // POST /admin/orgs — INTERNAL role only (enforced inside Lambda via JWT groups).
     // Generates slug-based org_id server-side; writes to orgsTable.
     const createOrgLambda = new lambda.Function(this, "CreateOrgLambda", {
@@ -1898,7 +1898,7 @@ export class BackendStack extends cdk.NestedStack {
     })
     orgsTable.grantReadWriteData(createOrgLambda)
 
-    // ── 5. Lambda: create-invite ──────────────────────────────────────────────
+    // ── 5. Lambda: create-invite  ─────
     // POST /admin/orgs/{orgId}/invites — INTERNAL only.
     // Reads orgsTable to validate org exists + ACTIVE.
     // Writes SHA-256 hash of token to invitesTable; returns raw token ONCE.
@@ -1927,7 +1927,7 @@ export class BackendStack extends cdk.NestedStack {
     orgsTable.grantReadData(createInviteLambda)
     invitesTable.grantReadWriteData(createInviteLambda)
 
-    // ── 6. Lambda: complete-registration ─────────────────────────────────────
+    // ── 6. Lambda: complete-registration    ─────
     // POST /auth/complete-external-registration — any authenticated user.
     // Validates invite token, creates membership record, adds user to Cognito group.
     // Needs cognito-idp:AdminAddUserToGroup to place the external user in the
@@ -1977,7 +1977,7 @@ export class BackendStack extends cdk.NestedStack {
     // basic_agent.py → resolve_principal_from_context → DynamoDB GetItem on memberships
     membershipsTable.grantReadData(this.agentRuntime.role)
 
-    // ── 8. Lambda: session-context ────────────────────────────────────────────
+    // ── 8. Lambda: session-context  ───
     // GET /auth/session-context — any authenticated user.
     // Returns authoritative session state: roleClass, membershipStatus, orgId,
     // orgName, and capabilities flags. Frontend calls this once on app load.
@@ -2005,7 +2005,7 @@ export class BackendStack extends cdk.NestedStack {
     membershipsTable.grantReadData(sessionContextLambda)
     orgsTable.grantReadData(sessionContextLambda)
 
-    // ── 9. Lambda: list-orgs ─────────────────────────────────────────────────
+    // ── 9. Lambda: list-orgs     
     // GET /admin/orgs — INTERNAL only. Returns all orgs.
     const listOrgsLambda = new lambda.Function(this, "ListOrgsLambda", {
       functionName: `${config.stack_name_base}-list-orgs`,
@@ -2031,7 +2031,7 @@ export class BackendStack extends cdk.NestedStack {
     orgsTable.grantReadData(listOrgsLambda)
     membershipsTable.grantReadData(listOrgsLambda)
 
-    // ── 9b. Lambda: get-org-detail ────────────────────────────────────────────
+    // ── 9b. Lambda: get-org-detail  ───
     // GET /admin/orgs/{orgId} — INTERNAL only. Returns org + members + invites.
     const getOrgDetailLambda = new lambda.Function(this, "GetOrgDetailLambda", {
       functionName: `${config.stack_name_base}-get-org-detail`,
@@ -2059,7 +2059,7 @@ export class BackendStack extends cdk.NestedStack {
     membershipsTable.grantReadData(getOrgDetailLambda)
     invitesTable.grantReadData(getOrgDetailLambda)
 
-    // ── 10. API Gateway routes ────────────────────────────────────────────────
+    // ── 10. API Gateway routes  ───────
     // Separate org-api RestApi for admin + auth endpoints.
     // Routes:
     //   GET  /auth/session-context                    — session bootstrap (any authenticated user)
@@ -2170,6 +2170,57 @@ export class BackendStack extends cdk.NestedStack {
         authorizationType: apigateway.AuthorizationType.COGNITO,
       }
     )
+
+    // ── 11. CDK Custom Resource: org-seed ────────────────────────────────────
+    // Runs on every deploy to ensure:
+    //   a) "org-internal" vendor org record exists in OrgsTable
+    //   b) All Cognito "internal" group users have an ACTIVE membership record
+    //
+    // Idempotent — existing records are never overwritten.
+    // New internal Cognito users are automatically seeded on the next deploy.
+    // External users are NOT seeded here — they go through the invite flow.
+    const orgSeedLambda = new lambda.Function(this, "OrgSeedLambda", {
+      functionName: `${config.stack_name_base}-org-seed`,
+      runtime:      lambda.Runtime.PYTHON_3_13,
+      code:         lambda.Code.fromAsset(
+        path.join(__dirname, "..", "lambdas", "org-seed")
+      ),
+      handler:      "index.handler",
+      architecture: lambda.Architecture.ARM_64,
+      timeout:      cdk.Duration.seconds(60),
+      memorySize:   256,
+      environment: {
+        ORGS_TABLE_NAME:        orgsTable.tableName,
+        MEMBERSHIPS_TABLE_NAME: membershipsTable.tableName,
+        USER_POOL_ID:           this.userPoolId,
+        STACK_NAME:             config.stack_name_base,
+      },
+      logGroup: new logs.LogGroup(this, "OrgSeedLogGroup", {
+        logGroupName:  `/aws/lambda/${config.stack_name_base}-org-seed`,
+        retention:     logs.RetentionDays.ONE_WEEK,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      }),
+    })
+
+    orgsTable.grantReadWriteData(orgSeedLambda)
+    membershipsTable.grantReadWriteData(orgSeedLambda)
+
+    orgSeedLambda.addToRolePolicy(new iam.PolicyStatement({
+      effect:  iam.Effect.ALLOW,
+      actions: ["cognito-idp:ListUsersInGroup"],
+      resources: [
+        `arn:aws:cognito-idp:${this.region}:${this.account}:userpool/${this.userPoolId}`,
+      ],
+    }))
+
+    // Bump SeedVersion to force a re-run if seed logic changes.
+    const orgSeedResource = new cdk.CustomResource(this, "OrgSeedResource", {
+      serviceToken: orgSeedLambda.functionArn,
+      properties: { SeedVersion: "1" },
+    })
+
+    orgSeedResource.node.addDependency(orgsTable)
+    orgSeedResource.node.addDependency(membershipsTable)
 
     // SSM: store org API URL so frontend can call admin + registration endpoints
     new ssm.StringParameter(this, "OrgApiUrlParam", {

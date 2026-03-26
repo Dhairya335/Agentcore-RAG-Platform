@@ -11,7 +11,7 @@ interface ChatInputProps {
   handleSubmit: (e: FormEvent) => void
   isLoading: boolean
   className?: string
-  // ── NEW: upload panel toggle ──────────────────────────────────────
+  // ── NEW: upload panel toggle    ──────
   onUploadClick?: () => void
   isUploadPanelOpen?: boolean
 }
@@ -22,7 +22,7 @@ export function ChatInput({
   handleSubmit,
   isLoading,
   className = "",
-  // ── NEW ──────────────────────────────────────────────────────────
+  // ── NEW       
   onUploadClick,
   isUploadPanelOpen = false,
 }: ChatInputProps) {
@@ -59,7 +59,7 @@ export function ChatInput({
         onSubmit={handleSubmit}
         className="flex space-x-2 w-full items-end bg-white rounded-lg shadow-lg border border-gray-200 p-3"
       >
-        {/* ── NEW: Paperclip button ─────────────────────────────────── */}
+        {/* ── NEW: Paperclip button    ─── */}
         {onUploadClick && (
           <Button
             type="button"

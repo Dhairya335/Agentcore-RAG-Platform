@@ -37,7 +37,7 @@ from bedrock_agentcore.runtime import RequestContext
 
 logger = logging.getLogger(__name__)
 
-# ─── Constants ────────────────────────────────────────────────────────────────
+# ─── Constants   
 
 INTERNAL_GROUP        = "internal"
 ROLE_INTERNAL         = "INTERNAL"
@@ -49,7 +49,7 @@ MEMBERSHIPS_TABLE_ENV = "MEMBERSHIPS_TABLE_NAME"
 ORG_INTERNAL = "org-internal"
 
 
-# ─── Data model ───────────────────────────────────────────────────────────────
+# ─── Data model      ────
 
 @dataclass(frozen=True)
 class PrincipalContext:
@@ -67,12 +67,12 @@ class MembershipError(Exception):
     """
 
 
-# ─── DynamoDB client (module-level, reused across warm invocations) ────────────
+# ─── DynamoDB client (module-level, reused across warm invocations)   ───
 
 _dynamodb = boto3.resource("dynamodb")
 
 
-# ─── Public API ───────────────────────────────────────────────────────────────
+# ─── Public API      ────
 
 def resolve_principal_from_context(context: RequestContext) -> PrincipalContext:
     """
@@ -117,7 +117,7 @@ def resolve_principal_from_claims(claims: dict[str, Any]) -> PrincipalContext:
     return _resolve_from_claims(claims)
 
 
-# ─── Internal resolution logic ─────────────────────────────────────────────────
+# ─── Internal resolution logic     
 
 def _resolve_from_claims(claims: dict[str, Any]) -> PrincipalContext:
     user_id = claims.get("sub", "").strip()

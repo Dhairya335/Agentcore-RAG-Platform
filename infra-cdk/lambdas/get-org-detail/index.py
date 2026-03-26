@@ -81,7 +81,7 @@ def handler(event: dict, context: object) -> dict:
     memberships_table = dynamodb.Table(MEMBERSHIPS_TABLE_NAME)
     invites_table     = dynamodb.Table(INVITES_TABLE_NAME)
 
-    # ── Fetch org record ──────────────────────────────────────────────────────
+    # ── Fetch org record    ────
     try:
         org_resp = orgs_table.get_item(
             Key={"org_id": org_id},
@@ -95,7 +95,7 @@ def handler(event: dict, context: object) -> dict:
     if not org:
         return _error(404, f"Organisation not found: {org_id}", event)
 
-    # ── Fetch members via GSI ─────────────────────────────────────────────────
+    # ── Fetch members via GSI     
     # Failure here is a hard error — returning empty members to the admin
     # would be misleading (they might think the org has no members).
     try:
@@ -108,7 +108,7 @@ def handler(event: dict, context: object) -> dict:
         print(f"[ORG DETAIL] DynamoDB query failed for members org_id={org_id}: {exc}")
         return _error(500, "Failed to fetch organisation members", event)
 
-    # ── Fetch invites via GSI ─────────────────────────────────────────────────
+    # ── Fetch invites via GSI     
     try:
         invites_raw = _query_all_pages(
             table=invites_table,

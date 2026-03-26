@@ -28,7 +28,7 @@ export class CognitoStack extends cdk.NestedStack {
     const defaultCallbackUrls = ["http://localhost:3000", "https://localhost:3000"]
     const finalCallbackUrls = callbackUrls || defaultCallbackUrls
 
-    // ── POST-CONFIRMATION LAMBDA TRIGGER ──────────────────────────────────────
+    // ── POST-CONFIRMATION LAMBDA TRIGGER    ──────
     // Fires after a user self-registers and confirms their email.
     // Automatically adds them to the 'external' group (Company B / client users).
     //
@@ -124,7 +124,7 @@ export class CognitoStack extends cdk.NestedStack {
       resources: ["*"],
     }))
 
-    // ── TRIGGER WIRING VIA CFN ESCAPE HATCH ───────────────────────────────────
+    // ── TRIGGER WIRING VIA CFN ESCAPE HATCH    ───
     //
     // Approach: set LambdaConfig.PostConfirmation directly on the CfnUserPool
     // resource via addPropertyOverride. This is a native CloudFormation property,
@@ -145,7 +145,7 @@ export class CognitoStack extends cdk.NestedStack {
     )
     cfnUserPool.node.addDependency(postConfirmationLambda)
 
-    // ── LAMBDA INVOKE PERMISSION ───────────────────────────────────────────────
+    // ── LAMBDA INVOKE PERMISSION  ──────
     //
     // Grant cognito-idp.amazonaws.com permission to invoke the Lambda, scoped to
     // this user pool's ARN (SourceArn). SourceArn is required — SourceAccount
@@ -204,7 +204,7 @@ export class CognitoStack extends cdk.NestedStack {
     addPermission.node.addDependency(postConfirmationLambda)
     addPermission.node.addDependency(userPool)
 
-    // ── COGNITO GROUPS ────────────────────────────────────────────────────────
+    // ── COGNITO GROUPS    ──────
     //
     // 'internal' group (precedence 1 — higher priority):
     //   Company A / vendor staff. Full access: document library, collections,

@@ -108,7 +108,7 @@ export default function InviteCompletePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [auth.isLoading, auth.user?.id_token])
 
-  // ── Completing ───────────────────────────────────────────────────────────────
+  // ── Completing      ────
   if (phase === "completing" || auth.isLoading) {
     return (
       <div className="flex flex-col items-center justify-center min-h-screen gap-4">
@@ -119,7 +119,7 @@ export default function InviteCompletePage() {
     )
   }
 
-  // ── Success ──────────────────────────────────────────────────────────────────
+  // ── Success   ──
   if (phase === "success") {
     return (
       <div className="flex flex-col items-center justify-center min-h-screen bg-gray-50 px-4">
@@ -151,7 +151,7 @@ export default function InviteCompletePage() {
     )
   }
 
-  // ── Error ────────────────────────────────────────────────────────────────────
+  // ── Error   ────
   return (
     <div className="flex flex-col items-center justify-center min-h-screen bg-gray-50 px-4">
       <div className="max-w-sm w-full bg-white rounded-xl border shadow-sm p-8 text-center space-y-4">

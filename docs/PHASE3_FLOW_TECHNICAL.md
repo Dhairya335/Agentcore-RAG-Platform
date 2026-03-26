@@ -354,7 +354,7 @@ ChatInterface.tsx additions:
 createDocumentUploadInfra(config, frontendUrl):
     ...existing presign Lambda...
 
-    ── ListDocumentsLambda ──────────────────────────────────────────────────────
+    ── ListDocumentsLambda    ────
     new lambda.Function(this, "ListDocumentsLambda", {
         functionName: "{stack}-list-documents",
         runtime:      PYTHON_3_13, architecture: ARM_64, timeout: 15s,
@@ -374,7 +374,7 @@ createDocumentUploadInfra(config, frontendUrl):
     })
         Route: GET /documents
 
-    ── GetDocumentLambda ────────────────────────────────────────────────────────
+    ── GetDocumentLambda    ──────
     new lambda.Function(this, "GetDocumentLambda", {
         functionName: "{stack}-get-document",
         runtime:      PYTHON_3_13, architecture: ARM_64, timeout: 10s,
@@ -390,7 +390,7 @@ createDocumentUploadInfra(config, frontendUrl):
     })
         Route: GET /documents/{docId}
 
-    ── GSI for collections (added to existing docsTable) ────────────────────────
+    ── GSI for collections (added to existing docsTable)  ─
     docsTable.addGlobalSecondaryIndex({
         indexName:            "entityType-tenantId-index",
         partitionKey:         { name: "entityType", type: STRING },
@@ -413,7 +413,7 @@ Module-level initialization (cold start):
     _cors_list = [o.strip() for o in CORS_ALLOWED_ORIGINS.split(",") if o.strip()]
 
 handler(event, context):
-    ── RBAC ────────────────────────────────────────────────────────────────────
+    ── RBAC   ────
     role = _extract_role(event)
         claims = event["requestContext"]["authorizer"]["claims"]
             ↑ API Gateway Cognito Authorizer decodes JWT and injects claims here.
@@ -424,14 +424,14 @@ handler(event, context):
         return "INTERNAL" if "internal" in group_list else "EXTERNAL"
     if role != "INTERNAL" → return 403
 
-    ── Input parsing ────────────────────────────────────────────────────────────
+    ── Input parsing      ─
     query_params = event.get("queryStringParameters") or {}
     tenant_id    = query_params.get("tenantId", "").strip()
     if not tenant_id → 400
     limit        = min(int(query_params.get("limit", 20)), 100)
     next_page_token = query_params.get("nextPageToken")
 
-    ── DynamoDB GSI Query ───────────────────────────────────────────────────────
+    ── DynamoDB GSI Query    ─────
     query_kwargs = {
         TableName:              TABLE_NAME,
         IndexName:              "tenantId-updatedAt-index",
@@ -456,7 +456,7 @@ handler(event, context):
 
     resp = dynamodb.query(**query_kwargs)
 
-    ── Shape response ────────────────────────────────────────────────────────────
+    ── Shape response      ─
     _shape_doc(item):
         pk     = item["PK"]["S"]  → "TENANT#abc#DOC#uuid"
         doc_id = pk.split("#DOC#")[-1]    ← extracts just the UUID suffix
@@ -471,7 +471,7 @@ handler(event, context):
             "errorMessage":  item["errorMessage"]["S"] if present else None,
         }
 
-    ── Pagination token encoding ─────────────────────────────────────────────────
+    ── Pagination token encoding     
     if "LastEvaluatedKey" in resp:
         new_token = base64.b64encode(
             json.dumps(resp["LastEvaluatedKey"]).encode()
@@ -492,7 +492,7 @@ handler(event, context):
     tenant_id = event["queryStringParameters"]["tenantId"]
     pk = f"TENANT#{tenant_id}#DOC#{doc_id}"
 
-    ── BatchGetItem: 2 keys, 1 round-trip ───────────────────────────────────────
+    ── BatchGetItem: 2 keys, 1 round-trip    ───────
     resp = dynamodb.batch_get_item(
         RequestItems={
             TABLE_NAME: {
@@ -513,7 +513,7 @@ handler(event, context):
     latest = by_sk.get("LATEST", {})
     ver1   = by_sk.get("VER#000001", {})
 
-    ── Merge strategy ────────────────────────────────────────────────────────────
+    ── Merge strategy      ─
     body = {
         "fileName":      _s(latest, "fileName") or _s(ver1, "fileName"),
             ↑ LATEST has fileName (set by ingestion-worker update). VER1 is fallback.
@@ -636,17 +636,17 @@ openDetail(doc: DocumentListItem):
 ### DynamoDB Key Patterns — Complete Reference
 
 ```
-── Existing document items (Phase 2) ────────────────────────────────────────────
+── Existing document items (Phase 2)  ───
 PK = "TENANT#{tenantId}#DOC#{docId}"
 SK = "VER#000001"              (version history)
 SK = "LATEST"                  (pointer to current state)
 
-── New collection items (Phase 3) ───────────────────────────────────────────────
+── New collection items (Phase 3)  ──────
 PK = "TENANT#{tenantId}#COL#{colId}"
 SK = "METADATA"                (collection descriptor — name, color, visibilityMode, docCount)
 SK = "DOC#{docId}"             (membership: one item per document in this collection)
 
-── GSI indexes ──────────────────────────────────────────────────────────────────
+── GSI indexes   ──
 tenantId-updatedAt-index
     PK = tenantId    SK = updatedAt
     Used by: list-documents (SK=LATEST filter post-query)
@@ -842,7 +842,7 @@ handler(event, context):
 
 retrieve(query, tenant_id, top_k, user_role, doc_ids, collection_id):
 
-    ── Phase 3.4: collection resolution ─────────────────────────────────────────
+    ── Phase 3.4: collection resolution  
     resolved_doc_ids = []
     if collection_id and DOCS_TABLE_NAME:
         resolved_doc_ids = _resolve_collection_members(tenant_id, collection_id)
@@ -853,11 +853,11 @@ retrieve(query, tenant_id, top_k, user_role, doc_ids, collection_id):
             ↑ and the explicit docIds list.
             ↑ list() preserves determinism for SQL param binding order.
 
-    ── Step 1: embed ─────────────────────────────────────────────────────────────
+    ── Step 1: embed      ──
     query_vector = _embed_text(query)
         Unchanged from Phase 2D.
 
-    ── Step 2: two-stage retrieval with visibility filter ────────────────────────
+    ── Step 2: two-stage retrieval with visibility filter  ─
     fetch_limit = top_k * 2
     raw_chunks  = _vector_search(
         query_vector, tenant_id, fetch_limit,
@@ -865,11 +865,11 @@ retrieve(query, tenant_id, top_k, user_role, doc_ids, collection_id):
         doc_ids=resolved_doc_ids,
     )
 
-    ── Step 3: similarity threshold ─────────────────────────────────────────────
+    ── Step 3: similarity threshold  ────
     filtered = [c for c in raw_chunks if c["similarity"] >= 0.30]
     final_chunks = filtered[:top_k]
 
-    ── Step 4: role-aware context formatting ────────────────────────────────────
+    ── Step 4: role-aware context formatting    ────
     context_block = _format_context(final_chunks, user_role)
 
 _resolve_collection_members(tenant_id, collection_id):
@@ -890,13 +890,13 @@ _resolve_collection_members(tenant_id, collection_id):
 _vector_search(query_vector, tenant_id, fetch_limit, allowed_visibility, doc_ids):
     ...existing SSM reads and vector literal serialization...
 
-    ── Visibility IN clause ─────────────────────────────────────────────────────
+    ── Visibility IN clause    ───
     vis_params = [f":vis_{i}" for i in range(len(allowed_visibility))]
     vis_clause = ", ".join(vis_params)
         INTERNAL: vis_clause = ":vis_0, :vis_1"
         EXTERNAL: vis_clause = ":vis_0"
 
-    ── doc_id scope clause ──────────────────────────────────────────────────────
+    ── doc_id scope clause    ────
     doc_clause = ""
     if doc_ids:
         doc_params_names = [f":doc_{i}" for i in range(len(doc_ids))]
@@ -1056,9 +1056,9 @@ handler(event, context):
     db_secret_arn  = _get_ssm("aurora-secret-arn")
     db_name        = _get_ssm("aurora-db-name")
 
-    ── MODE SELECTION ────────────────────────────────────────────────────────────
+    ── MODE SELECTION      ─
     if raw_anchor is not None and str(raw_anchor).lstrip("-").isdigit():
-        ── ANCHOR MODE (SourceViewerDrawer) ─────────────────────────────────────
+        ── ANCHOR MODE (SourceViewerDrawer)    ─────
         anchor = int(raw_anchor)           ← 0-based chunk index
         half   = limit // 2               ← e.g., limit=5 → half=2
         lo     = max(0, anchor - half)    ← floor at 0 (no negative indexes)
@@ -1077,7 +1077,7 @@ handler(event, context):
             ↑ One SQL round-trip for the entire window.
             ↑ ORDER BY chunk_index ensures anchor is always in the middle.
     else:
-        ── PREVIEW MODE (DocumentDetailPanel) ────────────────────────────────────
+        ── PREVIEW MODE (DocumentDetailPanel)    ────
         sql = """
             SELECT chunk_index, chunk_total, content, page_number, section_title, source_type
             FROM   fast_chunks
@@ -1109,7 +1109,7 @@ Import addition:
 create_basic_agent(user_id, session_id, user_role="EXTERNAL"):
     ← New parameter: user_role
 
-    ── Role-aware system prompt ──────────────────────────────────────────────────
+    ── Role-aware system prompt    
     if user_role == "INTERNAL":
         citation_format_instruction = """CITATION FORMAT (internal user, full citations):
       [Source: <file_name>, docId:<doc_id>, page <page_number>, chunk <X>/<Y>]

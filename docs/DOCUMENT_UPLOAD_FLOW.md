@@ -28,18 +28,18 @@ backend-stack.ts
 └── constructor()
     └── this.createDocumentUploadInfra(config, frontendUrl)
         │
-        ├── new s3.Bucket()  ──────────────────────────────────────────────────────────────
+        ├── new s3.Bucket()       ───
         │     name:       "{stack_name_base}-raw-docs"
         │     encryption: S3_MANAGED
         │     cors:       PUT allowed from frontendUrl + localhost:3000
         │     blockPublicAccess: BLOCK_ALL
         │     AWS SERVICE: Amazon S3
         │
-        ├── new ssm.StringParameter()  ────────────────────────────────────────────────────
+        ├── new ssm.StringParameter()     ──
         │     parameterName: "/{stack}/rag/docs-bucket-name"
         │     AWS SERVICE: AWS SSM Parameter Store
         │
-        ├── new dynamodb.Table()  ─────────────────────────────────────────────────────────
+        ├── new dynamodb.Table()     ───────
         │     tableName:     "{stack_name_base}-documents"
         │     partitionKey:  PK (STRING)
         │     sortKey:       SK (STRING)
@@ -56,7 +56,7 @@ backend-stack.ts
         ├── new ssm.StringParameter()
         │     parameterName: "/{stack}/rag/docs-table-name"
         │
-        ├── new PythonFunction()  ─────────────────────────────────────────────────────────
+        ├── new PythonFunction()     ───────
         │     functionName: "{stack_name_base}-presign-upload"
         │     runtime:      PYTHON_3_13
         │     entry:        lambdas/presign-upload/
@@ -77,7 +77,7 @@ backend-stack.ts
         │     Grants Lambda dynamodb:GetItem, PutItem, UpdateItem etc.
         │     AWS SERVICE: IAM
         │
-        ├── new apigateway.RestApi()  ─────────────────────────────────────────────────────
+        ├── new apigateway.RestApi()     ───
         │     restApiName: "{stack_name_base}-docs-api"
         │     stageName:   "prod"
         │     CORS:        frontendUrl + localhost:3000
@@ -529,7 +529,7 @@ documentService.ts
       └── return new Promise((resolve, reject) => {
               const xhr = new XMLHttpRequest()
 
-              ── EVENT LISTENER 1: Progress ──────────────────────────────────
+              ── EVENT LISTENER 1: Progress    ──
               xhr.upload.addEventListener("progress", (event) => {
                 if (event.lengthComputable && onProgress) {
                   const percent = Math.round((event.loaded / event.total) * 100)
@@ -546,7 +546,7 @@ documentService.ts
                 }
               })
 
-              ── EVENT LISTENER 2: Load (complete) ───────────────────────────
+              ── EVENT LISTENER 2: Load (complete)  ────
               xhr.addEventListener("load", () => {
                 if (xhr.status >= 200 && xhr.status < 300) {
                   onProgress?.(100)   ← fires final 100% progress
@@ -556,12 +556,12 @@ documentService.ts
                 }
               })
 
-              ── EVENT LISTENER 3: Network Error ─────────────────────────────
+              ── EVENT LISTENER 3: Network Error  ──────
               xhr.addEventListener("error", () => {
                 reject(new Error("S3 upload failed: network error"))
               })
 
-              ── OPEN + SEND ──────────────────────────────────────────────────
+              ── OPEN + SEND    
               xhr.open("PUT", uploadUrl)
               │  uploadUrl = presigned S3 URL with embedded SigV4 signature
               │  AWS SERVICE: Amazon S3 (direct PUT, no Lambda involved)
@@ -620,7 +620,7 @@ DocumentUploadPanel.tsx
 ## PHASE 11 — Error Handling Paths
 
 ```
-── Error in getPresignedUploadUrl() ────────────────────────────────────────────
+── Error in getPresignedUploadUrl()  ───
   fetch() fails OR response.ok = false
     → throw new Error(...)
     → caught in handleUpload() try/catch
@@ -629,7 +629,7 @@ DocumentUploadPanel.tsx
     Panel renders red error UI with message
     "Try again" button → handleReset() → setState({ status: "idle" })
 
-── Error in uploadFileToS3() ───────────────────────────────────────────────────
+── Error in uploadFileToS3()    ─
   xhr "error" event fires (network failure)
     → reject(new Error("S3 upload failed: network error"))
     → Promise rejects
@@ -643,13 +643,13 @@ DocumentUploadPanel.tsx
       403 = Presigned URL expired (> 15 min old)
       403 = CORS not configured on S3 bucket
 
-── Lambda DynamoDB TransactionCanceledException ────────────────────────────────
+── Lambda DynamoDB TransactionCanceledException    
   409 returned from API Gateway
     → getPresignedUploadUrl throws Error("Version conflict...")
     → propagates up through uploadDocument → handleUpload
     → setState({ status: "error", ... })
 
-── Authentication errors ────────────────────────────────────────────────────────
+── Authentication errors    ──────
   auth.user?.id_token is null/undefined
     → handleUpload() catches this BEFORE calling uploadDocument
     → setState({ status: "error", message: "Authentication required..." })
@@ -685,35 +685,35 @@ Also triggered by:
 ## Complete State Machine — UploadState
 
 ```
-                    ┌─────────────────────────────────────────┐
+                    ┌ ┐
                     │                                         │
                     ▼                                         │
-              ┌──────────┐                                    │
-              │   idle   │ ◄── handleReset() ─────────────────┤
+              ┌  ─┐                                    │
+              │   idle   │ ◄── handleReset()      ┤
               └────┬─────┘                                    │
                    │ selectFile(file) — validation passes     │
                    ▼                                          │
-           ┌──────────────┐                                   │
-           │   selected   │ ──── validateFile fails ──────────┤
+           ┌  ─────┐                                   │
+           │   selected   │ ──── validateFile fails   ─┤
            └──────┬───────┘                                   │
                   │ handleUpload() called                     │
                   ▼                                           │
-          ┌───────────────┐                                   │
-          │   uploading   │ ──── fetch/XHR error ─────────────┤
+          ┌  ──────┐                                   │
+          │   uploading   │ ──── fetch/XHR error   ────┤
           │  progress 0→  │                                   │
           │     100%      │                                   │
-          └──────┬────────┘                                   │
+          └──────┬   ┘                                   │
                  │ uploadDocument resolves                    │
                  ▼                                            │
-          ┌─────────────┐                                     │
-          │   success   │ ──── "Upload another" ─────────────►┘
-          └─────────────┘
+          ┌  ────┐                                     │
+          │   success   │ ──── "Upload another"   ────►┘
+          └  ────┘
                  │
                  └── "Done" → onClose() → panel unmounts
 
-          ┌─────────────┐
+          ┌  ────┐
           │    error    │ ──── "Try again" → handleReset() → idle
-          └─────────────┘
+          └  ────┘
 ```
 
 ---

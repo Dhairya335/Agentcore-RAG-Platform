@@ -47,29 +47,29 @@ python test-scripts/test-agent-docker.py --pattern langgraph-single-agent
 4. **Test**: Opens interactive chat session against `localhost:8080`
 
 ```
-┌─────────────────────────────────────────────────────────────┐
+┌     ──┐
 │  Local Machine                                              │
-│  ┌─────────────────────────────────────────────────────┐   │
+│  ┌   ───┐   │
 │  │  Docker Container (ARM64)                           │   │
-│  │  ┌─────────────────────────────────────────────┐   │   │
+│  │  ┌ ────┐   │   │
 │  │  │  Agent (basic_agent.py / langgraph_agent.py)│   │   │
 │  │  │  - Listens on :8080                         │   │   │
 │  │  │  - Uses passed AWS credentials              │   │   │
-│  │  └─────────────────────────────────────────────┘   │   │
-│  └─────────────────────────────────────────────────────────┘   │
+│  │  └ ────┘   │   │
+│  └   ───────┘   │
 │                           │                                 │
 │                           ▼                                 │
 │              http://localhost:8080/invocations              │
-└─────────────────────────────────────────────────────────────┘
+└     ──┘
                             │
                             ▼
-              ┌─────────────────────────────────┐
+              ┌   ─┐
               │  AWS (Deployed Resources)       │
               │  - AgentCore Memory             │
               │  - AgentCore Gateway            │
               │  - SSM Parameters               │
               │  - Secrets Manager              │
-              └─────────────────────────────────┘
+              └   ─┘
 ```
 
 ## Environment Variables

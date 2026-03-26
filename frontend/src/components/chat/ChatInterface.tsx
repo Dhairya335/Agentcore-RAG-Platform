@@ -222,7 +222,7 @@ export default function ChatInterface() {
     setIsUploadPanelOpen(false)
   }
 
-  // ── NEW: when upload succeeds, close panel and notify user in chat ─────────
+  // ── NEW: when upload succeeds, close panel and notify user in chat   
   const handleUploadSuccess = (doc: UploadedDocument) => {
     setIsUploadPanelOpen(false)
     // Add a system-style message so user knows what was uploaded
@@ -240,7 +240,7 @@ export default function ChatInterface() {
   // ── Shared input area (used in both initial and chat-in-progress states), extract it here so upload panel always appears directly above input
   const inputArea = (
     <>
-      {/* ── NEW: Upload panel slides in above the input bar ─────────────── */}
+      {/* ── NEW: Upload panel slides in above the input bar   ────── */}
       {isUploadPanelOpen && (
         <DocumentUploadPanel
           onClose={() => setIsUploadPanelOpen(false)}
@@ -252,7 +252,7 @@ export default function ChatInterface() {
         setInput={setInput}
         handleSubmit={handleSubmit}
         isLoading={isLoading}
-        // ── NEW props ────────────────────────────────────────────────────
+        // ── NEW props    ──
         onUploadClick={() => setIsUploadPanelOpen((prev) => !prev)}
         isUploadPanelOpen={isUploadPanelOpen}
       />

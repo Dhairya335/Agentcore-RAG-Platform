@@ -59,7 +59,7 @@ def handler(event, context):
       "s3Key":     "orgs/{org_id}/documents/{docId}/v1/{fileName}"
     }
     """
-    # ── 1. Parse request body ───────────────────────────────────────────────
+    # ── 1. Parse request body  ──────
     try:
         body = json.loads(event.get("body", "{}"))
     except Exception:
@@ -75,7 +75,7 @@ def handler(event, context):
     if sharing_scope not in ("ORG_SHARED", "OWNER_ONLY"):
         sharing_scope = "ORG_SHARED"
 
-    # ── 2. Resolve principal from JWT claims ────────────────────────────────
+    # ── 2. Resolve principal from JWT claims    
     # API Gateway Cognito authorizer has validated the JWT.
     # Claims are in requestContext.authorizer.claims.
     claims = (event.get("requestContext") or {}).get("authorizer", {}).get("claims", {})
@@ -88,7 +88,7 @@ def handler(event, context):
         groups = [g.strip() for g in groups.split(",") if g.strip()]
     role_class = "INTERNAL" if "internal" in groups else "EXTERNAL"
 
-    # ── 3. Resolve org_id from membership table ─────────────────────────────
+    # ── 3. Resolve org_id from membership table  ──────
     # org_id is authoritative — never trust browser-supplied value
     try:
         org_id = _resolve_org_id(user_id)
@@ -99,7 +99,7 @@ def handler(event, context):
         print(f"[PRESIGN][ERROR] Membership lookup failed: {e}")
         return _error(500, "Failed to resolve organisation membership", event)
 
-    # ── 4. Generate doc_id and compute S3 key ───────────────────────────────
+    # ── 4. Generate doc_id and compute S3 key     
     doc_id  = body.get("docId") or str(uuid.uuid4())
 
     # Version: check LATEST record for this org+doc
@@ -116,7 +116,7 @@ def handler(event, context):
     # New key format: orgs/{org_id}/documents/{doc_id}/v{version}/{fileName}
     s3_key = f"orgs/{org_id}/documents/{doc_id}/v{version}/{file_name}"
 
-    # ── 5. Generate presigned PUT URL ───────────────────────────────────────
+    # ── 5. Generate presigned PUT URL    ───────
     # S3 object metadata passes org-id (not user sub) to the ingestion worker.
     # Ingestion worker reads these from head_object() — stateless at ingest time.
     try:
@@ -141,7 +141,7 @@ def handler(event, context):
 
     now = datetime.now(timezone.utc).isoformat()
 
-    # ── 6. Write DynamoDB document records atomically ───────────────────────
+    # ── 6. Write DynamoDB document records atomically  
     # PK uses org_id so all members of the org can look up the document.
     try:
         dynamodb_client.transact_write_items(

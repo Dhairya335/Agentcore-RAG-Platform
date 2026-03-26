@@ -93,7 +93,7 @@ def handler(event: dict, context: object) -> dict:
             },
         })
 
-    # ── EXTERNAL: look up membership record ──────────────────────────────────
+    # ── EXTERNAL: look up membership record    ──
     memberships_table = dynamodb.Table(MEMBERSHIPS_TABLE_NAME)
     try:
         mem_resp = memberships_table.get_item(
@@ -130,7 +130,7 @@ def handler(event: dict, context: object) -> dict:
         print(f"[SESSION] ACTIVE membership for sub={user_sub} has empty org_id")
         return _error(500, "Membership record is missing org_id — contact administrator", event)
 
-    # ── Fetch org name (required — not optional) ─────────────────────────────
+    # ── Fetch org name (required — not optional)  ──────
     orgs_table = dynamodb.Table(ORGS_TABLE_NAME)
     try:
         org_resp = orgs_table.get_item(

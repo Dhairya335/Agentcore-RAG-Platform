@@ -42,12 +42,12 @@ MAX_LIMIT     = 100
 
 
 def handler(event, context):
-    # ── RBAC: internal only ──────────────────────────────────────────────────
+    # ── RBAC: internal only    
     role = _extract_role(event)
     if role != "INTERNAL":
         return _error(403, "Document library access requires INTERNAL role", event)
 
-    # ── Input ────────────────────────────────────────────────────────────────
+    # ── Input   
     query_params = event.get("queryStringParameters") or {}
     tenant_id    = query_params.get("tenantId", "").strip()
 
@@ -61,7 +61,7 @@ def handler(event, context):
 
     next_page_token = query_params.get("nextPageToken")
 
-    # ── DynamoDB GSI query ───────────────────────────────────────────────────
+    # ── DynamoDB GSI query    ─
     # Query GSI partitioned by tenantId, sorted by updatedAt DESC.
     # FilterExpression SK = LATEST ensures we only return one row per document
     # (not one row per version).
@@ -91,7 +91,7 @@ def handler(event, context):
         print(f"[LIST-DOCS ERROR] DynamoDB query failed: {e}")
         return _error(500, f"Failed to list documents: {str(e)}", event)
 
-    # ── Shape response ───────────────────────────────────────────────────────
+    # ── Shape response    ─────
     items   = resp.get("Items", [])
     docs    = [_shape_doc(item) for item in items]
 
@@ -121,7 +121,7 @@ def handler(event, context):
     }
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# ── Helpers   ──
 
 def _shape_doc(item: dict) -> dict:
     """
